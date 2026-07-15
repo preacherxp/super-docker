@@ -1,0 +1,17 @@
+[package]
+name = "super-docker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+
+[[bin]]
+name = "super-docker"
+path = "src/main.rs"
+
+# short alias - same app, second binary name
+[[bin]]
+name = "sd"
+path = "src/main.rs"
