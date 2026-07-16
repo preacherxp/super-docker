@@ -3,10 +3,12 @@
 > A fast, event-driven terminal UI for Docker — containers, compose projects,
 > images, volumes and networks in one keyboard-first dashboard.
 
-Written in Rust on [tokio](https://tokio.rs) + [bollard](https://crates.io/crates/bollard) +
-[ratatui](https://ratatui.rs). Talks to the Docker socket directly — no `docker` CLI
-shelling for data, no polling storms. It subscribes to the Docker **events stream**
-and refreshes only what changed.
+Written in Rust with exactly **two dependencies**: [ratatui](https://ratatui.rs)
+and [crossterm](https://crates.io/crates/crossterm). No tokio, no bollard, no
+serde — it speaks HTTP/1.1 to the Docker socket with its own tiny client and
+JSON parser. It subscribes to the Docker **events stream** and refreshes only
+what changed, so there are no polling storms and no `docker` CLI shelling for
+data.
 
 ```
 ┌ [1] Containers (7) ──────────┐┌ web-1 — Up 2 hours · created 2h ago ─────────┐
@@ -96,12 +98,30 @@ That's it — no config file needed. Compose actions additionally require the
 [docker compose plugin](https://docs.docker.com/compose/install/) (detected at
 startup; everything else works without it).
 
+### Finding the daemon
+
+`DOCKER_HOST` wins when set (`unix://` and `tcp://` both work). Otherwise the
+first socket that exists is used, so Docker Desktop, rootless Docker, Colima
+and Rancher Desktop all work out of the box:
+
+```mermaid
+flowchart TD
+    A{"DOCKER_HOST set?"} -- "unix:// or tcp://" --> B([use it])
+    A -- no --> C["~/.docker/run/docker.sock<br/><i>Docker Desktop / rootless</i>"]
+    C -- missing --> D["~/.colima/default/docker.sock<br/><i>Colima</i>"]
+    D -- missing --> E["~/.rd/docker.sock<br/><i>Rancher Desktop</i>"]
+    E -- missing --> F["/var/run/docker.sock<br/><i>system daemon</i>"]
+    F -- missing --> G["$XDG_RUNTIME_DIR/docker.sock"]
+    C & D & E & F & G -- found --> B
+    G -- missing --> H([error: no docker socket found])
+```
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | `j`/`k`, `↑`/`↓` | move selection (scrolls logs when the detail pane is focused) |
-| `Tab`, `1`–`5` | switch panel |
+| `Tab` / `Shift-Tab`, `1`–`5` | switch panel |
 | `Enter` / `l` | focus the detail pane |
 | `h` / `Esc` | focus back to the panel list |
 | `z` | zoom the focused pane to full screen |
@@ -134,25 +154,79 @@ startup; everything else works without it).
 
 ## How it works
 
-```
-┌ docker events stream ─┐
-├ stats stream per ctr ─┤→ mpsc channel → App state → ratatui render
-├ logs stream (selected)┤     (redraw only on change or 250ms tick)
-└ fallback polling ─────┘
+Everything is plain threads and one `mpsc` channel — no async runtime. Each
+background thread owns one HTTP stream to the daemon and pushes updates into
+the channel; the main loop is the only place that blocks, and it only redraws
+when something actually changed (bursts of daemon samples are batched into a
+single frame):
+
+```mermaid
+flowchart LR
+    subgraph daemon["Docker daemon (unix socket / tcp)"]
+        EV(["/events"])
+        ST(["/containers/·/stats"])
+        LG(["/containers/·/logs"])
+        DF(["/system/df"])
+    end
+
+    subgraph threads["background threads"]
+        EVT["events listener"]
+        STT["stats streams<br/>one per running container"]
+        LGT["log + inspect stream<br/>follows the selection"]
+        POLL["poll fallback<br/>containers 2s · rest 14s"]
+    end
+
+    IN["terminal input<br/>keys · mouse"]
+
+    EV --> EVT
+    ST --> STT
+    LG --> LGT
+    DF --> POLL
+
+    EVT -- mpsc --> LOOP{{"main loop"}}
+    STT -- mpsc --> LOOP
+    LGT -- mpsc --> LOOP
+    POLL -- mpsc --> LOOP
+    IN -- mpsc --> LOOP
+
+    LOOP --> APP["App state"]
+    APP --> UI["ratatui frame<br/>drawn only on change"]
 ```
 
-- **bollard** talks to the Docker socket directly; Docker **events** trigger
-  targeted refreshes, polling is only a slow fallback (containers 2s, rest 15s)
+A daemon event triggers a targeted refresh instead of a full poll — this is
+what makes state changes show up instantly:
+
+```mermaid
+sequenceDiagram
+    participant D as Docker daemon
+    participant E as events thread
+    participant M as main loop
+    participant T as terminal
+
+    D->>E: die  (id: web-1, exitCode: 137, oom: true)
+    E->>M: refresh containers
+    M->>D: GET /containers/json
+    D-->>M: updated container list
+    Note over M: recompute badges:<br/>exit code · OOM · ↻loop
+    M->>T: redraw (batched, ≤1 frame / 100ms)
+```
+
+- The HTTP client is ~350 lines: HTTP/1.1 over a unix or tcp socket, one
+  request per connection, Content-Length / chunked / read-to-EOF bodies.
+  Long-lived streams (events, stats, logs) are cancelled from another thread
+  by shutting down a clone of the socket.
+- Docker **events** trigger targeted refreshes; polling is only a slow
+  fallback (containers every 2s, images/volumes/networks every 14s)
 - One stats stream per running container, reconciled on every refresh
-- Log/inspect streams restart automatically when the selection changes
+- Log and inspect streams restart automatically when the selection changes
 - Compose projects are derived from container labels — the `docker compose`
-  binary is only invoked for `up` / `down` / `build`-class operations, which
-  have no daemon API
+  binary is only invoked for `up` / `down` / `stop` / `restart` / `build`,
+  which have no daemon API
 
 ## Development
 
 ```sh
-cargo test          # unit test suite (filter, stats math, batching, compose…)
+cargo test          # unit test suite (http framing, filter, stats math, batching, compose…)
 cargo build --release
 ```
 
@@ -161,6 +235,6 @@ config file, remote hosts).
 
 ## Requirements
 
-- Docker daemon reachable via the default local socket
+- Docker daemon reachable via a local socket or `DOCKER_HOST`
 - `docker compose` plugin — optional, only for compose up/down/build
 - A terminal with mouse support (any modern one)
