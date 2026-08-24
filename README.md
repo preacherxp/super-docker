@@ -30,8 +30,8 @@ data.
 - **Docker Compose support** — projects auto-grouped from `com.docker.compose.*`
   labels (pure API), per-service status table, aggregated logs prefixed by
   service, and `up -d` / `stop` / `restart` / `build` / `down` actions
-- **Streaming logs** — follow mode, 5k-line scrollback, mouse-wheel scrolling,
-  log-level coloring (error / warn / debug)
+- **Streaming logs** — wrapped long lines, follow mode, 5k-line scrollback,
+  keyboard and mouse-wheel scrolling, log-level coloring (error / warn / debug)
 - **Live stats** — CPU + memory gauges with sparkline history (120 samples),
   network I/O, pid count; computed the same way `docker stats` does
   (page cache subtracted from memory usage)
@@ -147,6 +147,7 @@ flowchart TD
 | `E` | docker events overlay (j/k scroll, Esc closes) |
 | `PgUp`/`PgDn`, wheel | scroll logs |
 | `f` | follow logs |
+| `w` | toggle log wrapping |
 | `Esc` | unfocus detail, then clear marks, then filter |
 | left click / wheel | select, focus, tabs, scroll |
 | `?` | help overlay |

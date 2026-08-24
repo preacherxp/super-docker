@@ -322,8 +322,13 @@ pub struct App {
     pub logs_id: Option<String>,
     pub logs_members: Vec<String>,
     pub logs_handles: Vec<TaskHandle>,
+    /// Top rendered row in the log viewport. A single Docker log entry can
+    /// occupy multiple rows when wrapping is enabled.
     pub log_scroll: usize,
+    pub log_visual_rows: usize,
+    pub log_viewport_rows: usize,
     pub follow: bool,
+    pub wrap_logs: bool,
 
     pub inspect: Vec<(String, String)>,
     pub inspect_id: Option<String>,
@@ -374,7 +379,10 @@ impl App {
             logs_members: Vec::new(),
             logs_handles: Vec::new(),
             log_scroll: 0,
+            log_visual_rows: 0,
+            log_viewport_rows: 0,
             follow: true,
+            wrap_logs: true,
             inspect: Vec::new(),
             inspect_id: None,
             panel: Panel::Containers,
@@ -783,6 +791,8 @@ impl App {
         }
         self.logs.clear();
         self.log_scroll = 0;
+        self.log_visual_rows = 0;
+        self.log_viewport_rows = 0;
         self.follow = true;
         self.inspect.clear();
         self.logs_id = target.clone();
@@ -1074,7 +1084,14 @@ impl App {
 
     fn scroll_logs(&mut self, delta: i64) {
         self.follow = false;
-        let max = self.logs.len().saturating_sub(1);
+        // Before the first draw there is no viewport geometry yet; retaining
+        // the raw-line fallback also keeps keyboard navigation responsive in
+        // very small terminals where the log viewport disappears.
+        let max = if self.log_viewport_rows == 0 {
+            self.logs.len().saturating_sub(1)
+        } else {
+            self.log_visual_rows.saturating_sub(self.log_viewport_rows)
+        };
         let cur = self.log_scroll as i64 + delta;
         self.log_scroll = cur.clamp(0, max as i64) as usize;
     }
@@ -1258,6 +1275,7 @@ impl App {
             KeyCode::Char('f') => {
                 self.follow = true;
             }
+            KeyCode::Char('w') => self.wrap_logs = !self.wrap_logs,
             KeyCode::Char('y') => self.yank(false),
             KeyCode::Char('Y') => self.yank(true),
             KeyCode::Char('o') => self.open_port(),
@@ -2276,6 +2294,31 @@ mod tests {
         // selection untouched while detail is focused
         assert_eq!(app.sel[Panel::Containers as usize], 0);
         assert_eq!(app.panel, Panel::Containers);
+    }
+
+    #[test]
+    fn log_scrolling_uses_rendered_row_bounds() {
+        let mut app = test_app();
+        app.logs = vec!["one raw line".into()];
+        app.log_visual_rows = 20;
+        app.log_viewport_rows = 5;
+        app.log_scroll = 15;
+        app.focus = Focus::Detail;
+
+        app.on_key(key('j'));
+        assert_eq!(app.log_scroll, 15);
+        app.on_key(key('k'));
+        assert_eq!(app.log_scroll, 14);
+    }
+
+    #[test]
+    fn w_toggles_log_wrapping() {
+        let mut app = test_app();
+        assert!(app.wrap_logs);
+        app.on_key(key('w'));
+        assert!(!app.wrap_logs);
+        app.on_key(key('w'));
+        assert!(app.wrap_logs);
     }
 
     #[test]

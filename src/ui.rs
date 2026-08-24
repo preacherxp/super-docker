@@ -826,40 +826,91 @@ fn log_line_style(line: &str) -> Style {
     }
 }
 
-fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    // The top border used for the follow indicator is outside the log
-    // viewport itself.
-    let h = area.height.saturating_sub(1) as usize;
-    let len = app.logs.len();
-    let start = if app.follow {
-        len.saturating_sub(h)
-    } else {
-        app.log_scroll.min(len.saturating_sub(1))
-    };
-    let end = (start + h).min(len);
-    let lines: Vec<Line> = app.logs[start..end]
-        .iter()
-        .map(|l| Line::from(Span::styled(l.clone(), log_line_style(l))))
-        .collect();
-    let mode = if app.follow {
-        Span::styled(" following ", Style::default().fg(Color::Black).bg(Color::Green))
-    } else {
-        Span::styled(
-            format!(" {}/{} (f: follow) ", end, len),
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        )
-    };
+/// Convert raw Docker log entries to terminal rows. Logs are hard-wrapped
+/// instead of word-wrapped so long JSON values and identifiers cannot spill
+/// outside the detail pane. Ratatui's grapheme iterator keeps emoji, combining
+/// characters, and double-width glyphs intact without another dependency.
+fn visual_log_lines(logs: &[String], width: usize, wrap: bool) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for log in logs {
+        let style = log_line_style(log);
+        if !wrap || width == 0 {
+            rows.push(Line::from(Span::styled(log.clone(), style)));
+            continue;
+        }
+
+        let source = Span::raw(log.as_str());
+        let mut row = String::new();
+        let mut row_width: usize = 0;
+        for grapheme in source.styled_graphemes(Style::default()) {
+            let grapheme_width = Span::raw(grapheme.symbol).width();
+            if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+                rows.push(Line::from(Span::styled(std::mem::take(&mut row), style)));
+                row_width = 0;
+            }
+            row.push_str(grapheme.symbol);
+            row_width = row_width.saturating_add(grapheme_width);
+        }
+        rows.push(Line::from(Span::styled(row, style)));
+    }
+    rows
+}
+
+fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
+    // Keep a dedicated final column for the scrollbar so wrapped text never
+    // renders underneath it.
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(BORDER_DIM))
-        .title_alignment(Alignment::Right)
-        .title(mode);
-    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
-    let scrollbar_area = Rect {
-        y: area.y.saturating_add(1),
-        height: area.height.saturating_sub(1),
-        ..area
+        .title_alignment(Alignment::Right);
+    let inner = block.inner(area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let text_area = columns[0];
+    let scrollbar_area = columns[1];
+    let h = text_area.height as usize;
+    let mut lines = visual_log_lines(&app.logs, text_area.width as usize, app.wrap_logs);
+    let len = lines.len();
+    let max_scroll = len.saturating_sub(h);
+    let start = if app.follow {
+        max_scroll
+    } else {
+        app.log_scroll.min(max_scroll)
     };
+    let end = start.saturating_add(h).min(len);
+
+    // Input handling happens outside the renderer, so publish the current
+    // visual geometry and position for line/page/wheel scrolling.
+    app.log_visual_rows = len;
+    app.log_viewport_rows = h;
+    app.log_scroll = start;
+
+    let mode = if app.follow {
+        Span::styled(
+            format!(
+                " following · wrap:{} ",
+                if app.wrap_logs { "on" } else { "off" }
+            ),
+            Style::default().fg(Color::Black).bg(Color::Green),
+        )
+    } else {
+        Span::styled(
+            format!(
+                " {end}/{len} rows · f follow · w wrap:{} ",
+                if app.wrap_logs { "on" } else { "off" }
+            ),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )
+    };
+    f.render_widget(block.title(mode), area);
+    let visible = if start < end {
+        lines.drain(start..end).collect()
+    } else {
+        Vec::new()
+    };
+    f.render_widget(Paragraph::new(Text::from(visible)), text_area);
     render_scrollbar(f, scrollbar_area, len, h, start);
 }
 
@@ -1103,6 +1154,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     ("j/k", "scroll"),
                     ("[/]", "tab"),
                     ("f", "follow"),
+                    ("w", "wrap"),
                     ("g", "top"),
                     ("x", "env"),
                     ("z", "zoom"),
@@ -1272,6 +1324,7 @@ fn draw_help(f: &mut Frame) {
         ("mouse", "click select/focus/tabs, wheel scroll"),
         ("PgUp/PgDn", "scroll logs"),
         ("f", "follow logs"),
+        ("w", "toggle log wrapping"),
         ("q / Ctrl-c", "quit"),
     ];
     let w = 52;
@@ -1507,6 +1560,43 @@ mod tests {
         assert_eq!(log_line_style("WARN slow query").fg, Some(Color::Yellow));
         assert_eq!(log_line_style("DEBUG noise").fg, Some(DIM));
         assert_eq!(log_line_style("plain info line").fg, None);
+    }
+
+    #[test]
+    fn wrapped_logs_scroll_by_visual_rows() {
+        let mut app = rendered_app();
+        app.logs = vec!["abcdefghijklmnopqrstuv".into()];
+        let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
+
+        terminal.draw(|f| draw_logs(f, &mut app, f.area())).unwrap();
+
+        // One column is reserved for the scrollbar, so 22 characters become
+        // four rows of seven in a three-row viewport.
+        assert_eq!(app.log_visual_rows, 4);
+        assert_eq!(app.log_viewport_rows, 3);
+        assert_eq!(app.log_scroll, 1);
+
+        app.focus = Focus::Detail;
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.follow);
+        assert_eq!(app.log_scroll, 0);
+
+        app.wrap_logs = false;
+        terminal.draw(|f| draw_logs(f, &mut app, f.area())).unwrap();
+        assert_eq!(app.log_visual_rows, 1);
+        assert_eq!(app.log_scroll, 0);
+    }
+
+    #[test]
+    fn wrapping_preserves_wide_graphemes() {
+        let logs = vec!["ab🙂cd".to_string()];
+        let rows = visual_log_lines(&logs, 4, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].to_string(), "ab🙂");
+        assert_eq!(rows[1].to_string(), "cd");
     }
 
     #[test]
