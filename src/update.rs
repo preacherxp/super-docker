@@ -56,7 +56,15 @@ pub fn spawn_check(tx: AppSender) {
 /// Install one exact release selected in the TUI.
 pub fn install_release(tag: &str) -> Result<(), String> {
     match Command::new("cargo")
-        .args(["install", "--git", REPOSITORY, "--tag", tag, "--force"])
+        .args([
+            "install",
+            "--git",
+            REPOSITORY,
+            "--tag",
+            tag,
+            "--force",
+            "super-docker",
+        ])
         .status()
     {
         Ok(status) if status.success() => Ok(()),

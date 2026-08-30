@@ -16,7 +16,7 @@ Requirements:
 Install directly from GitHub:
 
 ```sh
-cargo install --git https://github.com/preacherxp/super-docker
+cargo install --git https://github.com/preacherxp/super-docker super-docker
 sd
 ```
 
