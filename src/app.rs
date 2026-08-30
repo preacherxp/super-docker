@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
 use crossterm::event::{
@@ -10,10 +11,14 @@ use ratatui::widgets::TableState;
 
 use crate::compose::{self, ComposeAction};
 use crate::docker::{self, CtrAction, Docker, TaskHandle};
+use crate::operations::{self, OperationRow};
 
 pub const HISTORY_LEN: usize = 120;
 pub const MAX_LOG_LINES: usize = 5000;
+pub const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_LOG_LINE_BYTES: usize = 256 * 1024;
 pub const MAX_EVENTS: usize = 500;
+const SELECTION_SYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(125);
 /// A container that dies this many times inside the window is restart-looping.
 pub const RESTART_LOOP_THRESHOLD: usize = 3;
 pub const RESTART_LOOP_WINDOW_SECS: i64 = 300;
@@ -113,6 +118,52 @@ pub struct StatsHistory {
     pub last: Option<StatSample>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Normal,
+    Error,
+    Warn,
+    Debug,
+}
+
+impl LogLevel {
+    pub fn classify(line: &str) -> Self {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+            Self::Error
+        } else if lower.contains("warn") {
+            Self::Warn
+        } else if lower.contains("debug") || lower.contains("trace") {
+            Self::Debug
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    pub seq: u64,
+    pub text: String,
+    pub level: LogLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualLogRow {
+    pub seq: u64,
+    pub text: String,
+    pub level: LogLevel,
+}
+
+#[derive(Debug, Default)]
+pub struct LogRenderCache {
+    pub width: usize,
+    pub wrap: bool,
+    pub configured: bool,
+    pub last_seq: Option<u64>,
+    pub rows: VecDeque<VisualLogRow>,
+}
+
 /// One entry from the Docker daemon events stream.
 #[derive(Debug, Clone)]
 pub struct EventRow {
@@ -129,6 +180,10 @@ pub struct EventRow {
 #[derive(Debug)]
 pub enum AppEvent {
     Version(String),
+    UpdateAvailable {
+        version: String,
+        tag: String,
+    },
     Containers(Vec<ContainerRow>),
     Images(Vec<ImageRow>),
     Volumes(Vec<VolumeRow>),
@@ -145,6 +200,10 @@ pub enum AppEvent {
     /// the main loop blocks in one place. Handled in `main`, not `apply`.
     Input(Event),
 }
+
+/// Bounded producer used by every background task.  A bounded channel keeps a
+/// stalled terminal from turning a stats or log burst into unbounded memory.
+pub type AppSender = SyncSender<AppEvent>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -246,6 +305,9 @@ pub enum Mode {
     Signal(String, String),
     Help,
     Events,
+    Operations,
+    /// Non-blocking update check result: (display version, exact git tag).
+    Update(String, String),
 }
 
 pub struct Toast {
@@ -281,7 +343,10 @@ pub const SORT_COLS: [&[&str]; 5] = [
 
 /// Numeric/time columns read best largest-or-newest-first.
 fn default_desc(col: &str) -> bool {
-    matches!(col, "created" | "size" | "cpu" | "mem" | "running" | "total" | "containers")
+    matches!(
+        col,
+        "created" | "size" | "cpu" | "mem" | "running" | "total" | "containers"
+    )
 }
 
 /// Running things first, then roughly by how dead they are.
@@ -297,9 +362,21 @@ fn state_rank(s: RowState) -> u8 {
     }
 }
 
+#[derive(Debug, Default)]
+struct ViewCache {
+    source_len: usize,
+    data_revision: u64,
+    stats_revision: u64,
+    filter: String,
+    sort: usize,
+    descending: bool,
+    initialized: bool,
+    indices: Vec<usize>,
+}
+
 pub struct App {
     pub docker: Docker,
-    pub tx: Sender<AppEvent>,
+    pub tx: AppSender,
 
     pub version: String,
     pub containers: Vec<ContainerRow>,
@@ -310,18 +387,29 @@ pub struct App {
     pub volume_sizes: HashMap<String, i64>,
     pub networks: Vec<NetworkRow>,
     pub stats: HashMap<String, StatsHistory>,
+    data_revisions: [u64; 5],
+    stats_revision: u64,
+    view_caches: [RefCell<ViewCache>; 5],
 
     /// Rolling buffer of daemon events, oldest first.
     pub events: VecDeque<EventRow>,
     /// Scroll offset from the bottom of the events overlay (0 = newest).
     pub events_scroll: usize,
+    /// Persistent user-operation history loaded when the overlay opens.
+    pub operations: Vec<OperationRow>,
+    pub operations_scroll: usize,
     /// Containers the daemon reported an `oom` event for; cleared on `start`.
     pub oom_ids: HashSet<String>,
+    die_events: HashMap<String, VecDeque<i64>>,
 
-    pub logs: Vec<String>,
+    pub logs: VecDeque<LogEntry>,
+    pub log_bytes: usize,
+    pub next_log_seq: u64,
+    pub log_render_cache: LogRenderCache,
     pub logs_id: Option<String>,
     pub logs_members: Vec<String>,
     pub logs_handles: Vec<TaskHandle>,
+    selection_sync_due: Option<Instant>,
     /// Top rendered row in the log viewport. A single Docker log entry can
     /// occupy multiple rows when wrapping is enabled.
     pub log_scroll: usize,
@@ -355,10 +443,11 @@ pub struct App {
     pub docker_err: Option<String>,
     pub should_quit: bool,
     pub pending_exec: Option<String>,
+    pub pending_update: Option<(String, String)>,
 }
 
 impl App {
-    pub fn new(docker: Docker, tx: Sender<AppEvent>) -> Self {
+    pub fn new(docker: Docker, tx: AppSender) -> Self {
         Self {
             docker,
             tx,
@@ -371,13 +460,23 @@ impl App {
             volume_sizes: HashMap::new(),
             networks: Vec::new(),
             stats: HashMap::new(),
+            data_revisions: [0; 5],
+            stats_revision: 0,
+            view_caches: std::array::from_fn(|_| RefCell::new(ViewCache::default())),
             events: VecDeque::new(),
             events_scroll: 0,
+            operations: Vec::new(),
+            operations_scroll: 0,
             oom_ids: HashSet::new(),
-            logs: Vec::new(),
+            die_events: HashMap::new(),
+            logs: VecDeque::new(),
+            log_bytes: 0,
+            next_log_seq: 0,
+            log_render_cache: LogRenderCache::default(),
             logs_id: None,
             logs_members: Vec::new(),
             logs_handles: Vec::new(),
+            selection_sync_due: None,
             log_scroll: 0,
             log_visual_rows: 0,
             log_viewport_rows: 0,
@@ -402,6 +501,24 @@ impl App {
             docker_err: None,
             should_quit: false,
             pending_exec: None,
+            pending_update: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_logs_for_test(&mut self, lines: impl IntoIterator<Item = String>) {
+        self.logs.clear();
+        self.log_bytes = 0;
+        self.next_log_seq = 0;
+        self.log_render_cache = LogRenderCache::default();
+        for text in lines {
+            self.log_bytes += text.len();
+            self.logs.push_back(LogEntry {
+                seq: self.next_log_seq,
+                level: LogLevel::classify(&text),
+                text,
+            });
+            self.next_log_seq += 1;
         }
     }
 
@@ -447,123 +564,176 @@ impl App {
 
     /// Last live stat for a container; -1 sorts stopped containers below 0%.
     fn last_stat(&self, c: &ContainerRow, f: impl Fn(&StatSample) -> f64) -> f64 {
-        self.stats.get(&c.id).and_then(|h| h.last.as_ref()).map(f).unwrap_or(-1.0)
+        self.stats
+            .get(&c.id)
+            .and_then(|h| h.last.as_ref())
+            .map(f)
+            .unwrap_or(-1.0)
+    }
+
+    fn view_indices(&self, panel: Panel) -> Vec<usize> {
+        let panel_index = panel as usize;
+        let source_len = match panel {
+            Panel::Containers => self.containers.len(),
+            Panel::Compose => self.compose.len(),
+            Panel::Images => self.images.len(),
+            Panel::Volumes => self.volumes.len(),
+            Panel::Networks => self.networks.len(),
+        };
+        let stats_revision =
+            if panel == Panel::Containers && matches!(self.sort_key(panel).0, "cpu" | "mem") {
+                self.stats_revision
+            } else {
+                0
+            };
+        {
+            let cache = self.view_caches[panel_index].borrow();
+            if cache.initialized
+                && cache.source_len == source_len
+                && cache.data_revision == self.data_revisions[panel_index]
+                && cache.stats_revision == stats_revision
+                && cache.filter == self.filter
+                && cache.sort == self.sort[panel_index]
+                && cache.descending == self.sort_desc[panel_index]
+            {
+                return cache.indices.clone();
+            }
+        }
+
+        let needle = self.filter.to_lowercase();
+        let (col, desc) = self.sort_key(panel);
+        let mut indices: Vec<usize> = (0..source_len)
+            .filter(|index| match panel {
+                Panel::Containers => {
+                    let row = &self.containers[*index];
+                    if needle.is_empty() {
+                        true
+                    } else {
+                        let mut hay = String::with_capacity(row.name.len() + row.image.len() + 1);
+                        hay.push_str(&row.name);
+                        hay.push(' ');
+                        hay.push_str(&row.image);
+                        Self::matches_normalized(&hay, &needle)
+                    }
+                }
+                Panel::Compose => Self::matches_normalized(&self.compose[*index].name, &needle),
+                Panel::Images => Self::matches_normalized(&self.images[*index].tag, &needle),
+                Panel::Volumes => Self::matches_normalized(&self.volumes[*index].name, &needle),
+                Panel::Networks => Self::matches_normalized(&self.networks[*index].name, &needle),
+            })
+            .collect();
+        indices.sort_by(|a, b| {
+            let ord = match panel {
+                Panel::Containers => {
+                    let (a, b) = (&self.containers[*a], &self.containers[*b]);
+                    let primary = match col {
+                        "name" => a.name.cmp(&b.name),
+                        "image" => a.image.cmp(&b.image),
+                        "created" => a.created.cmp(&b.created),
+                        "cpu" => self
+                            .last_stat(a, |sample| sample.cpu_pct)
+                            .total_cmp(&self.last_stat(b, |sample| sample.cpu_pct)),
+                        "mem" => self
+                            .last_stat(a, |sample| sample.mem_pct)
+                            .total_cmp(&self.last_stat(b, |sample| sample.mem_pct)),
+                        _ => state_rank(a.state).cmp(&state_rank(b.state)),
+                    };
+                    let primary = if desc { primary.reverse() } else { primary };
+                    primary.then_with(|| a.name.cmp(&b.name))
+                }
+                Panel::Compose => {
+                    let (a, b) = (&self.compose[*a], &self.compose[*b]);
+                    let primary = match col {
+                        "running" => a.running.cmp(&b.running),
+                        "total" => a.total.cmp(&b.total),
+                        _ => a.name.cmp(&b.name),
+                    };
+                    let primary = if desc { primary.reverse() } else { primary };
+                    primary.then_with(|| a.name.cmp(&b.name))
+                }
+                Panel::Images => {
+                    let (a, b) = (&self.images[*a], &self.images[*b]);
+                    let primary = match col {
+                        "size" => a.size.cmp(&b.size),
+                        "tag" => a.tag.cmp(&b.tag),
+                        "containers" => a.containers.cmp(&b.containers),
+                        _ => a.created.cmp(&b.created),
+                    };
+                    let primary = if desc { primary.reverse() } else { primary };
+                    primary.then_with(|| a.tag.cmp(&b.tag))
+                }
+                Panel::Volumes => {
+                    let (a, b) = (&self.volumes[*a], &self.volumes[*b]);
+                    let size =
+                        |row: &VolumeRow| self.volume_sizes.get(&row.name).copied().unwrap_or(-1);
+                    let primary = match col {
+                        "size" => size(a).cmp(&size(b)),
+                        "driver" => a.driver.cmp(&b.driver),
+                        "created" => a.created.cmp(&b.created),
+                        _ => a.name.cmp(&b.name),
+                    };
+                    let primary = if desc { primary.reverse() } else { primary };
+                    primary.then_with(|| a.name.cmp(&b.name))
+                }
+                Panel::Networks => {
+                    let (a, b) = (&self.networks[*a], &self.networks[*b]);
+                    let primary = match col {
+                        "driver" => a.driver.cmp(&b.driver),
+                        "scope" => a.scope.cmp(&b.scope),
+                        _ => a.name.cmp(&b.name),
+                    };
+                    let primary = if desc { primary.reverse() } else { primary };
+                    primary.then_with(|| a.name.cmp(&b.name))
+                }
+            };
+            ord
+        });
+
+        let mut cache = self.view_caches[panel_index].borrow_mut();
+        cache.source_len = source_len;
+        cache.data_revision = self.data_revisions[panel_index];
+        cache.stats_revision = stats_revision;
+        cache.filter.clone_from(&self.filter);
+        cache.sort = self.sort[panel_index];
+        cache.descending = self.sort_desc[panel_index];
+        cache.initialized = true;
+        cache.indices.clone_from(&indices);
+        indices
     }
 
     pub fn filtered_containers(&self) -> Vec<&ContainerRow> {
-        let needle = self.filter.to_lowercase();
-        let mut v: Vec<&ContainerRow> = self
-            .containers
-            .iter()
-            .filter(|c| {
-                if needle.is_empty() {
-                    return true;
-                }
-                let mut hay = String::with_capacity(c.name.len() + c.image.len() + 1);
-                hay.push_str(&c.name);
-                hay.push(' ');
-                hay.push_str(&c.image);
-                Self::matches_normalized(&hay, &needle)
-            })
-            .collect();
-        let (col, desc) = self.sort_key(Panel::Containers);
-        v.sort_by(|a, b| {
-            let ord = match col {
-                "name" => a.name.cmp(&b.name),
-                "image" => a.image.cmp(&b.image),
-                "created" => a.created.cmp(&b.created),
-                "cpu" => self
-                    .last_stat(a, |s| s.cpu_pct)
-                    .total_cmp(&self.last_stat(b, |s| s.cpu_pct)),
-                "mem" => self
-                    .last_stat(a, |s| s.mem_pct)
-                    .total_cmp(&self.last_stat(b, |s| s.mem_pct)),
-                _ => state_rank(a.state).cmp(&state_rank(b.state)),
-            };
-            // tie-break stays ascending so `.` only flips the primary key
-            let ord = if desc { ord.reverse() } else { ord };
-            ord.then_with(|| a.name.cmp(&b.name))
-        });
-        v
+        self.view_indices(Panel::Containers)
+            .into_iter()
+            .map(|index| &self.containers[index])
+            .collect()
     }
+
     pub fn filtered_compose(&self) -> Vec<&ComposeRow> {
-        let needle = self.filter.to_lowercase();
-        let mut v: Vec<&ComposeRow> = self
-            .compose
-            .iter()
-            .filter(|p| Self::matches_normalized(&p.name, &needle))
-            .collect();
-        let (col, desc) = self.sort_key(Panel::Compose);
-        v.sort_by(|a, b| {
-            let ord = match col {
-                "running" => a.running.cmp(&b.running),
-                "total" => a.total.cmp(&b.total),
-                _ => a.name.cmp(&b.name),
-            };
-            let ord = if desc { ord.reverse() } else { ord };
-            ord.then_with(|| a.name.cmp(&b.name))
-        });
-        v
+        self.view_indices(Panel::Compose)
+            .into_iter()
+            .map(|index| &self.compose[index])
+            .collect()
     }
+
     pub fn filtered_images(&self) -> Vec<&ImageRow> {
-        let needle = self.filter.to_lowercase();
-        let mut v: Vec<&ImageRow> = self
-            .images
-            .iter()
-            .filter(|i| Self::matches_normalized(&i.tag, &needle))
-            .collect();
-        let (col, desc) = self.sort_key(Panel::Images);
-        v.sort_by(|a, b| {
-            let ord = match col {
-                "size" => a.size.cmp(&b.size),
-                "tag" => a.tag.cmp(&b.tag),
-                "containers" => a.containers.cmp(&b.containers),
-                _ => a.created.cmp(&b.created),
-            };
-            let ord = if desc { ord.reverse() } else { ord };
-            ord.then_with(|| a.tag.cmp(&b.tag))
-        });
-        v
+        self.view_indices(Panel::Images)
+            .into_iter()
+            .map(|index| &self.images[index])
+            .collect()
     }
+
     pub fn filtered_volumes(&self) -> Vec<&VolumeRow> {
-        let needle = self.filter.to_lowercase();
-        let mut v: Vec<&VolumeRow> = self
-            .volumes
-            .iter()
-            .filter(|v| Self::matches_normalized(&v.name, &needle))
-            .collect();
-        let (col, desc) = self.sort_key(Panel::Volumes);
-        let size = |v: &VolumeRow| self.volume_sizes.get(&v.name).copied().unwrap_or(-1);
-        v.sort_by(|a, b| {
-            let ord = match col {
-                "size" => size(a).cmp(&size(b)),
-                "driver" => a.driver.cmp(&b.driver),
-                "created" => a.created.cmp(&b.created),
-                _ => a.name.cmp(&b.name),
-            };
-            let ord = if desc { ord.reverse() } else { ord };
-            ord.then_with(|| a.name.cmp(&b.name))
-        });
-        v
+        self.view_indices(Panel::Volumes)
+            .into_iter()
+            .map(|index| &self.volumes[index])
+            .collect()
     }
+
     pub fn filtered_networks(&self) -> Vec<&NetworkRow> {
-        let needle = self.filter.to_lowercase();
-        let mut v: Vec<&NetworkRow> = self
-            .networks
-            .iter()
-            .filter(|n| Self::matches_normalized(&n.name, &needle))
-            .collect();
-        let (col, desc) = self.sort_key(Panel::Networks);
-        v.sort_by(|a, b| {
-            let ord = match col {
-                "driver" => a.driver.cmp(&b.driver),
-                "scope" => a.scope.cmp(&b.scope),
-                _ => a.name.cmp(&b.name),
-            };
-            let ord = if desc { ord.reverse() } else { ord };
-            ord.then_with(|| a.name.cmp(&b.name))
-        });
-        v
+        self.view_indices(Panel::Networks)
+            .into_iter()
+            .map(|index| &self.networks[index])
+            .collect()
     }
 
     fn panel_len(&self) -> usize {
@@ -577,24 +747,34 @@ impl App {
     }
 
     pub fn selected_container(&self) -> Option<&ContainerRow> {
-        let list = self.filtered_containers();
-        list.get(self.sel[Panel::Containers as usize]).copied()
+        let index = *self
+            .view_indices(Panel::Containers)
+            .get(self.sel[Panel::Containers as usize])?;
+        self.containers.get(index)
     }
     pub fn selected_compose(&self) -> Option<&ComposeRow> {
-        let list = self.filtered_compose();
-        list.get(self.sel[Panel::Compose as usize]).copied()
+        let index = *self
+            .view_indices(Panel::Compose)
+            .get(self.sel[Panel::Compose as usize])?;
+        self.compose.get(index)
     }
     pub fn selected_image(&self) -> Option<&ImageRow> {
-        let list = self.filtered_images();
-        list.get(self.sel[Panel::Images as usize]).copied()
+        let index = *self
+            .view_indices(Panel::Images)
+            .get(self.sel[Panel::Images as usize])?;
+        self.images.get(index)
     }
     pub fn selected_volume(&self) -> Option<&VolumeRow> {
-        let list = self.filtered_volumes();
-        list.get(self.sel[Panel::Volumes as usize]).copied()
+        let index = *self
+            .view_indices(Panel::Volumes)
+            .get(self.sel[Panel::Volumes as usize])?;
+        self.volumes.get(index)
     }
     pub fn selected_network(&self) -> Option<&NetworkRow> {
-        let list = self.filtered_networks();
-        list.get(self.sel[Panel::Networks as usize]).copied()
+        let index = *self
+            .view_indices(Panel::Networks)
+            .get(self.sel[Panel::Networks as usize])?;
+        self.networks.get(index)
     }
 
     /// Containers of a compose project, as (id, service name) pairs.
@@ -614,7 +794,9 @@ impl App {
         let mut map: std::collections::BTreeMap<String, ComposeRow> =
             std::collections::BTreeMap::new();
         for c in &self.containers {
-            let Some(project) = &c.compose_project else { continue };
+            let Some(project) = &c.compose_project else {
+                continue;
+            };
             let row = map.entry(project.clone()).or_insert_with(|| ComposeRow {
                 name: project.clone(),
                 config_files: String::new(),
@@ -634,6 +816,8 @@ impl App {
             }
         }
         self.compose = map.into_values().collect();
+        self.data_revisions[Panel::Compose as usize] =
+            self.data_revisions[Panel::Compose as usize].wrapping_add(1);
     }
 
     fn clamp_selections(&mut self) {
@@ -656,6 +840,9 @@ impl App {
     pub fn apply(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Version(v) => self.version = v,
+            AppEvent::UpdateAvailable { version, tag } => {
+                self.mode = Mode::Update(version, tag);
+            }
             AppEvent::Containers(rows) => {
                 self.docker_err = None;
                 // drop stats history for containers that no longer exist
@@ -663,8 +850,11 @@ impl App {
                     rows.iter().map(|r| r.id.as_str()).collect();
                 self.stats.retain(|id, _| ids.contains(id.as_str()));
                 self.oom_ids.retain(|id| ids.contains(id.as_str()));
+                self.die_events.retain(|id, _| ids.contains(id.as_str()));
                 self.marked[Panel::Containers as usize].retain(|id| ids.contains(id.as_str()));
                 self.containers = rows;
+                self.data_revisions[Panel::Containers as usize] =
+                    self.data_revisions[Panel::Containers as usize].wrapping_add(1);
                 self.rebuild_compose();
                 self.clamp_selections();
                 self.sync_selection();
@@ -673,18 +863,24 @@ impl App {
                 let ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
                 self.marked[Panel::Images as usize].retain(|id| ids.contains(id.as_str()));
                 self.images = rows;
+                self.data_revisions[Panel::Images as usize] =
+                    self.data_revisions[Panel::Images as usize].wrapping_add(1);
                 self.clamp_selections();
             }
             AppEvent::Volumes(rows) => {
                 let names: HashSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
                 self.marked[Panel::Volumes as usize].retain(|n| names.contains(n.as_str()));
                 self.volumes = rows;
+                self.data_revisions[Panel::Volumes as usize] =
+                    self.data_revisions[Panel::Volumes as usize].wrapping_add(1);
                 self.clamp_selections();
             }
             AppEvent::Networks(rows) => {
                 let ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
                 self.marked[Panel::Networks as usize].retain(|id| ids.contains(id.as_str()));
                 self.networks = rows;
+                self.data_revisions[Panel::Networks as usize] =
+                    self.data_revisions[Panel::Networks as usize].wrapping_add(1);
                 self.clamp_selections();
             }
             AppEvent::Stat(s) => {
@@ -699,20 +895,33 @@ impl App {
                     }
                 }
                 h.last = Some(s);
+                self.stats_revision = self.stats_revision.wrapping_add(1);
             }
             AppEvent::Log(id, chunk) => {
                 if self.logs_id.as_deref() == Some(id.as_str()) {
                     for line in chunk.split('\n') {
                         let line = line.trim_end_matches('\r');
                         if !line.is_empty() {
-                            self.logs.push(line.to_string());
+                            let text = truncate_log_line(line);
+                            self.log_bytes = self.log_bytes.saturating_add(text.len());
+                            let entry = LogEntry {
+                                seq: self.next_log_seq,
+                                level: LogLevel::classify(&text),
+                                text,
+                            };
+                            self.next_log_seq = self.next_log_seq.wrapping_add(1);
+                            self.logs.push_back(entry);
                         }
                     }
-                    if self.logs.len() > MAX_LOG_LINES {
-                        let excess = self.logs.len() - MAX_LOG_LINES;
-                        self.logs.drain(..excess);
-                        self.log_scroll = self.log_scroll.saturating_sub(excess);
+                    let mut evicted = 0;
+                    while self.logs.len() > MAX_LOG_LINES || self.log_bytes > MAX_LOG_BYTES {
+                        let Some(entry) = self.logs.pop_front() else {
+                            break;
+                        };
+                        self.log_bytes = self.log_bytes.saturating_sub(entry.text.len());
+                        evicted += 1;
                     }
+                    self.log_scroll = self.log_scroll.saturating_sub(evicted);
                 }
             }
             AppEvent::Inspect(id, kv) => {
@@ -721,11 +930,19 @@ impl App {
                 }
             }
             AppEvent::Toast(text, error) => {
-                self.toast = Some(Toast { text, error, at: Instant::now() });
+                self.toast = Some(Toast {
+                    text,
+                    error,
+                    at: Instant::now(),
+                });
             }
             AppEvent::DockerErr(e) => self.docker_err = Some(e),
             AppEvent::ComposeAvailable(ok) => self.compose_ok = ok,
-            AppEvent::VolumeSizes(sizes) => self.volume_sizes = sizes,
+            AppEvent::VolumeSizes(sizes) => {
+                self.volume_sizes = sizes;
+                self.data_revisions[Panel::Volumes as usize] =
+                    self.data_revisions[Panel::Volumes as usize].wrapping_add(1);
+            }
             AppEvent::Event(ev) => {
                 if ev.typ == "container" {
                     match ev.action.as_str() {
@@ -734,6 +951,13 @@ impl App {
                         }
                         "start" => {
                             self.oom_ids.remove(&ev.id);
+                        }
+                        "die" => {
+                            let deaths = self.die_events.entry(ev.id.clone()).or_default();
+                            deaths.push_back(ev.at);
+                            while deaths.len() > MAX_EVENTS {
+                                deaths.pop_front();
+                            }
                         }
                         _ => {}
                     }
@@ -750,14 +974,11 @@ impl App {
 
     /// `die` events for this container inside the restart-loop window.
     pub fn recent_die_count(&self, id: &str, now: i64) -> usize {
-        self.events
-            .iter()
-            .filter(|e| {
-                e.typ == "container"
-                    && e.action == "die"
-                    && e.id == id
-                    && now - e.at <= RESTART_LOOP_WINDOW_SECS
-            })
+        self.die_events
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|at| now - **at <= RESTART_LOOP_WINDOW_SECS)
             .count()
     }
 
@@ -771,9 +992,16 @@ impl App {
         self.events_scroll = cur.clamp(0, max as i64) as usize;
     }
 
+    fn scroll_operations(&mut self, delta: i64) {
+        let max = self.operations.len().saturating_sub(1);
+        let cur = self.operations_scroll as i64 + delta;
+        self.operations_scroll = cur.clamp(0, max as i64) as usize;
+    }
+
     /// Restart log/inspect streams when the selected container or compose
     /// project changes (or a project's member set changes, e.g. after `up`).
     pub fn sync_selection(&mut self) {
+        self.selection_sync_due = None;
         let (target, members) = if self.panel == Panel::Compose {
             match self.selected_compose().map(|p| p.name.clone()) {
                 Some(name) => (Some(compose::log_key(&name)), self.compose_members(&name)),
@@ -790,6 +1018,8 @@ impl App {
             h.abort();
         }
         self.logs.clear();
+        self.log_bytes = 0;
+        self.log_render_cache = LogRenderCache::default();
         self.log_scroll = 0;
         self.log_visual_rows = 0;
         self.log_viewport_rows = 0;
@@ -806,9 +1036,38 @@ impl App {
         } else {
             self.inspect_id = target.clone();
             if let Some(id) = target {
-                self.logs_handles.push(docker::spawn_logs(&self.docker, &self.tx, id.clone()));
-                docker::spawn_inspect(&self.docker, &self.tx, id);
+                self.logs_handles
+                    .push(docker::spawn_logs(&self.docker, &self.tx, id.clone()));
+                self.logs_handles
+                    .push(docker::spawn_inspect(&self.docker, &self.tx, id));
             }
+        }
+    }
+
+    fn schedule_selection_sync(&mut self) {
+        if self.selection_sync_due.is_none() {
+            for handle in self.logs_handles.drain(..) {
+                handle.abort();
+            }
+            self.logs_id = None;
+            self.inspect_id = None;
+            self.logs.clear();
+            self.log_bytes = 0;
+            self.log_render_cache = LogRenderCache::default();
+            self.inspect.clear();
+        }
+        self.selection_sync_due = Some(Instant::now() + SELECTION_SYNC_DEBOUNCE);
+    }
+
+    pub fn flush_selection_sync(&mut self) -> bool {
+        if self
+            .selection_sync_due
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.sync_selection();
+            true
+        } else {
+            false
         }
     }
 
@@ -820,7 +1079,7 @@ impl App {
         let i = self.sel[self.panel as usize] as i64 + delta;
         self.sel[self.panel as usize] = i.clamp(0, len as i64 - 1) as usize;
         if matches!(self.panel, Panel::Containers | Panel::Compose) {
-            self.sync_selection();
+            self.schedule_selection_sync();
         }
     }
 
@@ -832,7 +1091,7 @@ impl App {
         }
         self.sel[self.panel as usize] = if top { 0 } else { len - 1 };
         if matches!(self.panel, Panel::Containers | Panel::Compose) {
-            self.sync_selection();
+            self.schedule_selection_sync();
         }
     }
 
@@ -841,17 +1100,25 @@ impl App {
     /// clipboard tool on either end.
     fn yank(&mut self, id_form: bool) {
         let text = match self.panel {
-            Panel::Containers => self
-                .selected_container()
-                .map(|c| if id_form { c.id.clone() } else { c.name.clone() }),
+            Panel::Containers => self.selected_container().map(|c| {
+                if id_form {
+                    c.id.clone()
+                } else {
+                    c.name.clone()
+                }
+            }),
             Panel::Compose => self.selected_compose().map(|p| p.name.clone()),
             Panel::Images => self
                 .selected_image()
                 .map(|i| if id_form { i.id.clone() } else { i.tag.clone() }),
             Panel::Volumes => self.selected_volume().map(|v| v.name.clone()),
-            Panel::Networks => self
-                .selected_network()
-                .map(|n| if id_form { n.id.clone() } else { n.name.clone() }),
+            Panel::Networks => self.selected_network().map(|n| {
+                if id_form {
+                    n.id.clone()
+                } else {
+                    n.name.clone()
+                }
+            }),
         };
         let Some(text) = text else { return };
         osc52_copy(&text);
@@ -865,7 +1132,9 @@ impl App {
         if self.panel != Panel::Containers {
             return;
         }
-        let Some(ports) = self.selected_container().map(|c| c.ports.clone()) else { return };
+        let Some(ports) = self.selected_container().map(|c| c.ports.clone()) else {
+            return;
+        };
         let Some(port) = first_public_port(&ports) else {
             self.apply(AppEvent::Toast("no published port".into(), true));
             return;
@@ -891,7 +1160,7 @@ impl App {
             if plen > 0 {
                 self.panel = p;
                 self.sel[p as usize] = if forward { 0 } else { plen - 1 };
-                self.sync_selection();
+                self.schedule_selection_sync();
                 return;
             }
         }
@@ -919,7 +1188,7 @@ impl App {
     /// Re-sorting moves a different row under the cursor — resync streams.
     fn after_sort_change(&mut self) {
         if matches!(self.panel, Panel::Containers | Panel::Compose) {
-            self.sync_selection();
+            self.schedule_selection_sync();
         }
     }
 
@@ -935,7 +1204,9 @@ impl App {
     }
 
     fn toggle_mark(&mut self) {
-        let Some(key) = self.selected_key() else { return };
+        let Some(key) = self.selected_key() else {
+            return;
+        };
         let set = &mut self.marked[self.panel as usize];
         if !set.remove(&key) {
             set.insert(key);
@@ -945,12 +1216,26 @@ impl App {
 
     fn toggle_mark_all(&mut self) {
         let keys: Vec<String> = match self.panel {
-            Panel::Containers => {
-                self.filtered_containers().iter().map(|c| c.id.clone()).collect()
-            }
-            Panel::Images => self.filtered_images().iter().map(|i| i.id.clone()).collect(),
-            Panel::Volumes => self.filtered_volumes().iter().map(|v| v.name.clone()).collect(),
-            Panel::Networks => self.filtered_networks().iter().map(|n| n.id.clone()).collect(),
+            Panel::Containers => self
+                .filtered_containers()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect(),
+            Panel::Images => self
+                .filtered_images()
+                .iter()
+                .map(|i| i.id.clone())
+                .collect(),
+            Panel::Volumes => self
+                .filtered_volumes()
+                .iter()
+                .map(|v| v.name.clone())
+                .collect(),
+            Panel::Networks => self
+                .filtered_networks()
+                .iter()
+                .map(|n| n.id.clone())
+                .collect(),
             Panel::Compose => Vec::new(),
         };
         if keys.is_empty() {
@@ -971,8 +1256,12 @@ impl App {
             ConfirmAction::RemoveContainer(id, name) => {
                 docker::container_action(&self.docker, &self.tx, CtrAction::Remove, id, name)
             }
-            ConfirmAction::RemoveImage(id, tag) => docker::remove_image(&self.docker, &self.tx, id, tag),
-            ConfirmAction::RemoveVolume(name) => docker::remove_volume(&self.docker, &self.tx, name),
+            ConfirmAction::RemoveImage(id, tag) => {
+                docker::remove_image(&self.docker, &self.tx, id, tag)
+            }
+            ConfirmAction::RemoveVolume(name) => {
+                docker::remove_volume(&self.docker, &self.tx, name)
+            }
             ConfirmAction::RemoveNetwork(id, name) => {
                 docker::remove_network(&self.docker, &self.tx, id, name)
             }
@@ -1028,10 +1317,22 @@ impl App {
                 }
                 return;
             }
-            Mode::Confirm(_) | Mode::Signal(..) => return,
+            Mode::Operations => {
+                match ev.kind {
+                    MouseEventKind::ScrollUp => self.scroll_operations(-3),
+                    MouseEventKind::ScrollDown => self.scroll_operations(3),
+                    MouseEventKind::Down(_) => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                return;
+            }
+            Mode::Confirm(_) | Mode::Signal(..) | Mode::Update(..) => return,
             _ => {}
         }
-        let pos = Position { x: ev.column, y: ev.row };
+        let pos = Position {
+            x: ev.column,
+            y: ev.row,
+        };
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 for i in 0..PANEL_ORDER.len() {
@@ -1044,13 +1345,12 @@ impl App {
                     // rows start after top border (1) + table header (1)
                     let data_top = r.y + 2;
                     if pos.y >= data_top && pos.y + 1 < r.y + r.height {
-                        let idx =
-                            self.table_states[i].offset() + (pos.y - data_top) as usize;
+                        let idx = self.table_states[i].offset() + (pos.y - data_top) as usize;
                         if idx < self.panel_len_at(i) {
                             self.sel[i] = idx;
                         }
                     }
-                    self.sync_selection();
+                    self.schedule_selection_sync();
                     return;
                 }
                 if self.panel == Panel::Containers && self.layout.tabs_row.contains(pos) {
@@ -1063,7 +1363,11 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let delta: i64 = if ev.kind == MouseEventKind::ScrollUp { -1 } else { 1 };
+                let delta: i64 = if ev.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
                 for i in 0..PANEL_ORDER.len() {
                     if self.layout.panels[i].contains(pos) {
                         self.panel = PANEL_ORDER[i];
@@ -1107,10 +1411,23 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.scroll_events(-1),
                 KeyCode::PageUp => self.scroll_events(10),
                 KeyCode::PageDown => self.scroll_events(-10),
-                KeyCode::Char('g') => {
-                    self.events_scroll = self.events.len().saturating_sub(1)
-                }
+                KeyCode::Char('g') => self.events_scroll = self.events.len().saturating_sub(1),
                 KeyCode::Char('G') => self.events_scroll = 0,
+                _ => self.mode = Mode::Normal,
+            },
+            Mode::Operations => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_operations(1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_operations(-1),
+                KeyCode::PageDown => self.scroll_operations(10),
+                KeyCode::PageUp => self.scroll_operations(-10),
+                KeyCode::Char('g') => self.operations_scroll = 0,
+                KeyCode::Char('G') => {
+                    self.operations_scroll = self.operations.len().saturating_sub(1)
+                }
+                KeyCode::Char('R') => {
+                    self.operations = operations::recent(MAX_EVENTS);
+                    self.operations_scroll = 0;
+                }
                 _ => self.mode = Mode::Normal,
             },
             Mode::Confirm(action) => {
@@ -1136,23 +1453,29 @@ impl App {
                     docker::kill_container(&self.docker, &self.tx, id, name, signal);
                 }
             }
+            Mode::Update(version, tag) => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                    self.pending_update = Some((version, tag));
+                }
+                self.mode = Mode::Normal;
+            }
             Mode::Filter => match key.code {
                 KeyCode::Esc => {
                     self.filter.clear();
                     self.mode = Mode::Normal;
                     self.clamp_selections();
-                    self.sync_selection();
+                    self.schedule_selection_sync();
                 }
                 KeyCode::Enter => self.mode = Mode::Normal,
                 KeyCode::Backspace => {
                     self.filter.pop();
                     self.clamp_selections();
-                    self.sync_selection();
+                    self.schedule_selection_sync();
                 }
                 KeyCode::Char(c) => {
                     self.filter.push(c);
                     self.clamp_selections();
-                    self.sync_selection();
+                    self.schedule_selection_sync();
                 }
                 _ => {}
             },
@@ -1173,6 +1496,11 @@ impl App {
                 self.events_scroll = 0;
                 self.mode = Mode::Events;
             }
+            KeyCode::Char('O') => {
+                self.operations = operations::recent(MAX_EVENTS);
+                self.operations_scroll = 0;
+                self.mode = Mode::Operations;
+            }
             KeyCode::Esc => {
                 if self.focus == Focus::Detail {
                     self.focus = Focus::Panels;
@@ -1181,7 +1509,7 @@ impl App {
                 } else if !self.filter.is_empty() {
                     self.filter.clear();
                     self.clamp_selections();
-                    self.sync_selection();
+                    self.schedule_selection_sync();
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') => self.focus = Focus::Detail,
@@ -1195,37 +1523,37 @@ impl App {
             KeyCode::Tab => {
                 self.panel = self.panel.next();
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::BackTab => {
                 self.panel = self.panel.prev();
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::Char('1') => {
                 self.panel = Panel::Containers;
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::Char('2') => {
                 self.panel = Panel::Compose;
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::Char('3') => {
                 self.panel = Panel::Images;
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::Char('4') => {
                 self.panel = Panel::Volumes;
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::Char('5') => {
                 self.panel = Panel::Networks;
                 self.focus = Focus::Panels;
-                self.sync_selection();
+                self.schedule_selection_sync();
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.focus == Focus::Detail {
@@ -1299,7 +1627,9 @@ impl App {
                     }
                     return;
                 }
-                let Some(c) = self.selected_container().cloned() else { return };
+                let Some(c) = self.selected_container().cloned() else {
+                    return;
+                };
                 let (docker, tx) = (&self.docker, &self.tx);
                 match key.code {
                     KeyCode::Char('s') => {
@@ -1352,7 +1682,9 @@ impl App {
                 }
             }
             Panel::Compose => {
-                let Some(p) = self.selected_compose().cloned() else { return };
+                let Some(p) = self.selected_compose().cloned() else {
+                    return;
+                };
                 let action = match key.code {
                     KeyCode::Char('u') => Some(ComposeAction::Up),
                     KeyCode::Char('s') => Some(ComposeAction::Stop),
@@ -1362,7 +1694,10 @@ impl App {
                         if self.compose_ok {
                             self.confirm(ConfirmAction::ComposeDown(p));
                         } else {
-                            self.apply(AppEvent::Toast("docker compose plugin not found".into(), true));
+                            self.apply(AppEvent::Toast(
+                                "docker compose plugin not found".into(),
+                                true,
+                            ));
                         }
                         return;
                     }
@@ -1372,44 +1707,45 @@ impl App {
                     if self.compose_ok {
                         compose::compose_action(&self.tx, action, p);
                     } else {
-                        self.apply(AppEvent::Toast("docker compose plugin not found".into(), true));
+                        self.apply(AppEvent::Toast(
+                            "docker compose plugin not found".into(),
+                            true,
+                        ));
                     }
                 }
             }
-            Panel::Images => {
-                match key.code {
-                    KeyCode::Char('d') => {
-                        let marked = &self.marked[Panel::Images as usize];
-                        if marked.is_empty() {
-                            if let Some(i) = self.selected_image().cloned() {
-                                self.confirm(ConfirmAction::RemoveImage(i.id, i.tag));
-                            }
-                        } else {
-                            let items: Vec<(String, String)> = self
-                                .images
-                                .iter()
-                                .filter(|x| marked.contains(&x.id))
-                                .map(|x| (x.id.clone(), x.tag.clone()))
-                                .collect();
-                            self.confirm(ConfirmAction::RemoveImagesBatch(items));
+            Panel::Images => match key.code {
+                KeyCode::Char('d') => {
+                    let marked = &self.marked[Panel::Images as usize];
+                    if marked.is_empty() {
+                        if let Some(i) = self.selected_image().cloned() {
+                            self.confirm(ConfirmAction::RemoveImage(i.id, i.tag));
                         }
-                    }
-                    KeyCode::Char('D') => {
+                    } else {
                         let items: Vec<(String, String)> = self
-                            .filtered_images()
+                            .images
                             .iter()
+                            .filter(|x| marked.contains(&x.id))
                             .map(|x| (x.id.clone(), x.tag.clone()))
                             .collect();
-                        if items.is_empty() {
-                            self.apply(AppEvent::Toast("no images to remove".into(), true));
-                        } else {
-                            self.confirm(ConfirmAction::RemoveImagesBatch(items));
-                        }
+                        self.confirm(ConfirmAction::RemoveImagesBatch(items));
                     }
-                    KeyCode::Char('P') => self.confirm(ConfirmAction::PruneImages),
-                    _ => {}
                 }
-            }
+                KeyCode::Char('D') => {
+                    let items: Vec<(String, String)> = self
+                        .filtered_images()
+                        .iter()
+                        .map(|x| (x.id.clone(), x.tag.clone()))
+                        .collect();
+                    if items.is_empty() {
+                        self.apply(AppEvent::Toast("no images to remove".into(), true));
+                    } else {
+                        self.confirm(ConfirmAction::RemoveImagesBatch(items));
+                    }
+                }
+                KeyCode::Char('P') => self.confirm(ConfirmAction::PruneImages),
+                _ => {}
+            },
             Panel::Volumes => match key.code {
                 KeyCode::Char('d') => {
                     let marked = &self.marked[Panel::Volumes as usize];
@@ -1428,8 +1764,11 @@ impl App {
                     }
                 }
                 KeyCode::Char('D') => {
-                    let items: Vec<String> =
-                        self.filtered_volumes().iter().map(|x| x.name.clone()).collect();
+                    let items: Vec<String> = self
+                        .filtered_volumes()
+                        .iter()
+                        .map(|x| x.name.clone())
+                        .collect();
                     if items.is_empty() {
                         self.apply(AppEvent::Toast("no volumes to remove".into(), true));
                     } else {
@@ -1502,18 +1841,45 @@ pub fn first_public_port(ports: &str) -> Option<u16> {
         .min()
 }
 
+fn truncate_log_line(line: &str) -> String {
+    if line.len() <= MAX_LOG_LINE_BYTES {
+        return line.to_string();
+    }
+    const SUFFIX: &str = "… [truncated]";
+    let mut end = MAX_LOG_LINE_BYTES.saturating_sub(SUFFIX.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 16);
+    out.push_str(&line[..end]);
+    out.push_str(SUFFIX);
+    out
+}
+
 /// Standard base64 (RFC 4648) — a dozen lines beats a dependency, OSC 52
 /// is the only consumer.
 pub fn base64(data: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
         let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
         out.push(TBL[(n >> 18 & 63) as usize] as char);
         out.push(TBL[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { TBL[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TBL[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TBL[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1623,7 +1989,7 @@ mod tests {
         // dummy client: constructing it never touches a socket, so tests
         // run without a docker daemon
         let docker = Docker::dummy();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
         // keep the receiver alive so sends don't fail
         std::mem::forget(rx);
         App::new(docker, tx)
@@ -1648,7 +2014,13 @@ mod tests {
         }
     }
 
-    fn compose_ctr(id: &str, name: &str, state: RowState, project: &str, service: &str) -> ContainerRow {
+    fn compose_ctr(
+        id: &str,
+        name: &str,
+        state: RowState,
+        project: &str,
+        service: &str,
+    ) -> ContainerRow {
         let mut c = ctr(id, name, state);
         c.compose_project = Some(project.into());
         c.compose_service = Some(service.into());
@@ -1656,7 +2028,13 @@ mod tests {
     }
 
     fn img(id: &str, tag: &str) -> ImageRow {
-        ImageRow { id: id.into(), tag: tag.into(), size: 0, created: 0, containers: 0 }
+        ImageRow {
+            id: id.into(),
+            tag: tag.into(),
+            size: 0,
+            created: 0,
+            containers: 0,
+        }
     }
 
     fn vol(name: &str) -> VolumeRow {
@@ -1841,7 +2219,13 @@ mod tests {
         let mut app = test_app();
         app.logs_id = Some("x".into());
         app.apply(AppEvent::Log("x".into(), "one\r\ntwo\n\nthree".into()));
-        assert_eq!(app.logs, vec!["one", "two", "three"]);
+        assert_eq!(
+            app.logs
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three"]
+        );
     }
 
     #[test]
@@ -1857,10 +2241,12 @@ mod tests {
         let mut app = test_app();
         app.logs_id = Some("x".into());
         app.log_scroll = 10;
-        let chunk = (0..MAX_LOG_LINES + 100).map(|i| format!("l{i}\n")).collect::<String>();
+        let chunk = (0..MAX_LOG_LINES + 100)
+            .map(|i| format!("l{i}\n"))
+            .collect::<String>();
         app.apply(AppEvent::Log("x".into(), chunk));
         assert_eq!(app.logs.len(), MAX_LOG_LINES);
-        assert_eq!(app.logs[0], "l100");
+        assert_eq!(app.logs[0].text, "l100");
         // scroll pulled back by the trimmed amount, saturating at 0
         assert_eq!(app.log_scroll, 0);
     }
@@ -1923,7 +2309,11 @@ mod tests {
         app.stats.insert("kept".into(), StatsHistory::default());
         app.marked[Panel::Containers as usize].insert("gone".into());
         app.marked[Panel::Containers as usize].insert("kept".into());
-        app.apply(AppEvent::Containers(vec![ctr("kept", "kept", RowState::Running)]));
+        app.apply(AppEvent::Containers(vec![ctr(
+            "kept",
+            "kept",
+            RowState::Running,
+        )]));
         assert!(app.stats.contains_key("kept"));
         assert!(!app.stats.contains_key("gone"));
         assert!(app.marked[Panel::Containers as usize].contains("kept"));
@@ -2054,7 +2444,11 @@ mod tests {
     fn toggle_mark_all_respects_filter_and_toggles_off() {
         let mut app = test_app();
         app.panel = Panel::Images;
-        app.images = vec![img("a", "nginx"), img("b", "redis"), img("c", "nginx-proxy")];
+        app.images = vec![
+            img("a", "nginx"),
+            img("b", "redis"),
+            img("c", "nginx-proxy"),
+        ];
         app.filter = "nginx".into();
         app.on_key(key('A'));
         let marked = &app.marked[Panel::Images as usize];
@@ -2118,7 +2512,10 @@ mod tests {
         app.panel = Panel::Images;
         app.images = vec![img("a", "a:1")];
         app.on_key(key('d'));
-        assert!(matches!(app.mode, Mode::Confirm(ConfirmAction::RemoveImage(..))));
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(ConfirmAction::RemoveImage(..))
+        ));
     }
 
     #[test]
@@ -2185,7 +2582,10 @@ mod tests {
 
     #[test]
     fn describe_batch_counts() {
-        let two = vec![("a".to_string(), "a".to_string()), ("b".to_string(), "b".to_string())];
+        let two = vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "b".to_string()),
+        ];
         assert_eq!(
             ConfirmAction::RemoveImagesBatch(two.clone()).describe(),
             "Force-remove 2 images?"
@@ -2198,7 +2598,10 @@ mod tests {
             ConfirmAction::RemoveVolumesBatch(vec!["v".into()]).describe(),
             "Remove 1 volumes?"
         );
-        assert_eq!(ConfirmAction::RemoveNetworksBatch(two).describe(), "Remove 2 networks?");
+        assert_eq!(
+            ConfirmAction::RemoveNetworksBatch(two).describe(),
+            "Remove 2 networks?"
+        );
     }
 
     #[test]
@@ -2256,7 +2659,10 @@ mod tests {
             app.panel = panel;
             app.on_key(key('D'));
             assert!(matches!(app.mode, Mode::Normal));
-            assert!(app.toast.as_ref().unwrap().error, "panel {panel:?} should toast");
+            assert!(
+                app.toast.as_ref().unwrap().error,
+                "panel {panel:?} should toast"
+            );
         }
     }
 
@@ -2284,7 +2690,7 @@ mod tests {
     fn jk_scroll_logs_when_detail_focused() {
         let mut app = test_app();
         app.containers = vec![ctr("c1", "a", RowState::Running)];
-        app.logs = (0..100).map(|i| i.to_string()).collect();
+        app.set_logs_for_test((0..100).map(|i| i.to_string()));
         app.focus = Focus::Detail;
         app.on_key(key('j'));
         assert!(!app.follow);
@@ -2299,7 +2705,7 @@ mod tests {
     #[test]
     fn log_scrolling_uses_rendered_row_bounds() {
         let mut app = test_app();
-        app.logs = vec!["one raw line".into()];
+        app.set_logs_for_test(["one raw line".into()]);
         app.log_visual_rows = 20;
         app.log_viewport_rows = 5;
         app.log_scroll = 15;
@@ -2336,7 +2742,9 @@ mod tests {
     #[test]
     fn clicking_last_visible_row_activates_collapsed_panel() {
         let mut app = test_app();
-        app.images = (0..5).map(|i| img(&format!("i{i}"), &format!("t{i}"))).collect();
+        app.images = (0..5)
+            .map(|i| img(&format!("i{i}"), &format!("t{i}")))
+            .collect();
         // A collapsed section is four rows high: border, header, one visible
         // data row, border. Its table has scrolled that data row to the end.
         app.layout.panels[Panel::Images as usize] = Rect::new(2, 10, 20, 4);
@@ -2465,9 +2873,18 @@ mod tests {
 
     #[test]
     fn health_from_status_variants() {
-        assert_eq!(health_from_status("Up 2 hours (healthy)"), HealthState::Healthy);
-        assert_eq!(health_from_status("Up 2 hours (unhealthy)"), HealthState::Unhealthy);
-        assert_eq!(health_from_status("Up 3 seconds (health: starting)"), HealthState::Starting);
+        assert_eq!(
+            health_from_status("Up 2 hours (healthy)"),
+            HealthState::Healthy
+        );
+        assert_eq!(
+            health_from_status("Up 2 hours (unhealthy)"),
+            HealthState::Unhealthy
+        );
+        assert_eq!(
+            health_from_status("Up 3 seconds (health: starting)"),
+            HealthState::Starting
+        );
         assert_eq!(health_from_status("Up 2 hours"), HealthState::None);
     }
 
@@ -2497,7 +2914,11 @@ mod tests {
     fn oom_ids_pruned_when_container_disappears() {
         let mut app = test_app();
         app.apply(AppEvent::Event(event(1, "container", "oom", "gone")));
-        app.apply(AppEvent::Containers(vec![ctr("kept", "kept", RowState::Running)]));
+        app.apply(AppEvent::Containers(vec![ctr(
+            "kept",
+            "kept",
+            RowState::Running,
+        )]));
         assert!(!app.oom_ids.contains("gone"));
     }
 
@@ -2506,7 +2927,12 @@ mod tests {
         let mut app = test_app();
         let now = 10_000i64;
         // one stale die outside the window, two fresh ones
-        app.apply(AppEvent::Event(event(now - RESTART_LOOP_WINDOW_SECS - 1, "container", "die", "c1")));
+        app.apply(AppEvent::Event(event(
+            now - RESTART_LOOP_WINDOW_SECS - 1,
+            "container",
+            "die",
+            "c1",
+        )));
         app.apply(AppEvent::Event(event(now - 100, "container", "die", "c1")));
         app.apply(AppEvent::Event(event(now - 10, "container", "die", "c1")));
         // other container and other action don't count
@@ -2561,7 +2987,11 @@ mod tests {
             ctr("c2", "alpha", RowState::Exited),
             ctr("c3", "beta", RowState::Running),
         ];
-        let names: Vec<&str> = app.filtered_containers().iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = app
+            .filtered_containers()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert_eq!(names, vec!["beta", "zeta", "alpha"]);
     }
 
@@ -2573,7 +3003,11 @@ mod tests {
         let mut new = img("b", "new:1");
         new.created = 200;
         app.images = vec![old, new];
-        let tags: Vec<&str> = app.filtered_images().iter().map(|i| i.tag.as_str()).collect();
+        let tags: Vec<&str> = app
+            .filtered_images()
+            .iter()
+            .map(|i| i.tag.as_str())
+            .collect();
         assert_eq!(tags, vec!["new:1", "old:1"]);
     }
 
@@ -2597,11 +3031,19 @@ mod tests {
         let mut app = test_app();
         app.panel = Panel::Volumes;
         app.volumes = vec![vol("b"), vol("a")];
-        let names: Vec<&str> = app.filtered_volumes().iter().map(|v| v.name.as_str()).collect();
+        let names: Vec<&str> = app
+            .filtered_volumes()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
         assert_eq!(names, vec!["a", "b"]);
         app.on_key(key('.'));
         assert_eq!(app.sort_indicator(Panel::Volumes), "↓name");
-        let names: Vec<&str> = app.filtered_volumes().iter().map(|v| v.name.as_str()).collect();
+        let names: Vec<&str> = app
+            .filtered_volumes()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
         assert_eq!(names, vec!["b", "a"]);
     }
 
@@ -2644,7 +3086,11 @@ mod tests {
             app.on_key(key(','));
         }
         assert_eq!(app.sort_indicator(Panel::Containers), "↓cpu");
-        let names: Vec<&str> = app.filtered_containers().iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = app
+            .filtered_containers()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert_eq!(names, vec!["busy", "idle", "dead"]);
     }
 
@@ -2659,7 +3105,11 @@ mod tests {
         app.apply(AppEvent::VolumeSizes(sizes));
         app.on_key(key(',')); // name -> size (desc)
         assert_eq!(app.sort_indicator(Panel::Volumes), "↓size");
-        let names: Vec<&str> = app.filtered_volumes().iter().map(|v| v.name.as_str()).collect();
+        let names: Vec<&str> = app
+            .filtered_volumes()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
         assert_eq!(names, vec!["big", "small", "unknown"]);
     }
 
@@ -2736,7 +3186,7 @@ mod tests {
     fn g_and_shift_g_control_logs_when_detail_focused() {
         let mut app = test_app();
         app.containers = vec![ctr("c1", "a", RowState::Running)];
-        app.logs = (0..50).map(|i| i.to_string()).collect();
+        app.set_logs_for_test((0..50).map(|i| i.to_string()));
         app.focus = Focus::Detail;
         app.on_key(key('g'));
         assert!(!app.follow);
@@ -2801,5 +3251,76 @@ mod tests {
         app.panel = Panel::Volumes;
         app.on_key(key('y'));
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn operations_overlay_opens_and_closes() {
+        let mut app = test_app();
+        app.on_key(key('O'));
+        assert!(matches!(app.mode, Mode::Operations));
+        assert_eq!(app.operations_scroll, 0);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn update_prompt_accepts_only_explicit_confirmation() {
+        let mut app = test_app();
+        app.apply(AppEvent::UpdateAvailable {
+            version: "9.8.7".into(),
+            tag: "v9.8.7".into(),
+        });
+        assert!(matches!(app.mode, Mode::Update(..)));
+        app.on_key(key('n'));
+        assert!(app.pending_update.is_none());
+        assert!(matches!(app.mode, Mode::Normal));
+
+        app.apply(AppEvent::UpdateAvailable {
+            version: "9.8.7".into(),
+            tag: "v9.8.7".into(),
+        });
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.pending_update, Some(("9.8.7".into(), "v9.8.7".into())));
+    }
+
+    #[test]
+    fn oversized_unicode_log_line_is_valid_and_strictly_bounded() {
+        let mut app = test_app();
+        app.logs_id = Some("c".into());
+        let input = "🙂".repeat(MAX_LOG_LINE_BYTES);
+        app.apply(AppEvent::Log("c".into(), input));
+        let text = &app.logs.front().unwrap().text;
+        assert!(text.is_char_boundary(text.len()));
+        assert!(text.ends_with("… [truncated]"));
+        assert!(text.len() <= MAX_LOG_LINE_BYTES);
+        assert_eq!(app.log_bytes, text.len());
+    }
+
+    #[test]
+    fn cached_view_reuses_then_invalidates_indices() {
+        let mut app = test_app();
+        app.apply(AppEvent::Images(vec![img("b", "b"), img("a", "a")]));
+        let first = app.view_indices(Panel::Images);
+        let revision = app.view_caches[Panel::Images as usize]
+            .borrow()
+            .data_revision;
+        assert_eq!(app.view_indices(Panel::Images), first);
+        assert_eq!(
+            app.view_caches[Panel::Images as usize]
+                .borrow()
+                .data_revision,
+            revision
+        );
+
+        app.filter = "a".into();
+        assert_eq!(app.view_indices(Panel::Images), vec![1]);
+        app.apply(AppEvent::Images(vec![img("c", "cat")]));
+        assert_eq!(app.view_indices(Panel::Images), vec![0]);
+        assert_ne!(
+            app.view_caches[Panel::Images as usize]
+                .borrow()
+                .data_revision,
+            revision
+        );
     }
 }

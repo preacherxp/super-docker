@@ -1,241 +1,137 @@
-# ⚡ super-docker
+# super-docker
 
-> A fast, event-driven terminal UI for Docker — containers, compose projects,
-> images, volumes and networks in one keyboard-first dashboard.
+A fast, keyboard-first terminal UI for Docker containers, Compose projects,
+images, volumes, and networks.
 
-Written in Rust with exactly **two dependencies**: [ratatui](https://ratatui.rs)
-and [crossterm](https://crates.io/crates/crossterm). No tokio, no bollard, no
-serde — it speaks HTTP/1.1 to the Docker socket with its own tiny client and
-JSON parser. It subscribes to the Docker **events stream** and refreshes only
-what changed, so there are no polling storms and no `docker` CLI shelling for
-data.
+![super-docker terminal demo](docs/demo.gif)
 
-```
-┌ [1] Containers (7) ──────────┐┌ web-1 — Up 2 hours · created 2h ago ─────────┐
-│ ● web-1          2%   1%     ││ Logs │ Stats │ Info                          │
-│ ● db-1           0%   4%     ││ 10:02:11 GET /health 200                     │
-│ ○ worker-1       -    -      ││ 10:02:14 GET /api/items 200                  │
-├ [2] Compose (2) ─────────────┤│ 10:02:15 POST /api/items 201                 │
-│ ● shop           3/3         ││ ...                                          │
-│ ◐ analytics      1/2         ││                                    following │
-├ [3] Images (12) ─────────────┤└──────────────────────────────────────────────┘
-```
+`super-docker` talks directly to the Docker Engine API and reacts to its event
+stream. It does not poll aggressively or shell out to the Docker CLI for data.
 
-## Features
+## Quick start
 
-- **Five live panels, accordion layout** — Containers, Compose projects, Images,
-  Volumes, Networks, all updating in real time via the Docker events stream;
-  the active panel expands, the rest collapse to a title line, and `z` zooms
-  any pane to full screen
-- **Docker Compose support** — projects auto-grouped from `com.docker.compose.*`
-  labels (pure API), per-service status table, aggregated logs prefixed by
-  service, and `up -d` / `stop` / `restart` / `build` / `down` actions
-- **Streaming logs** — wrapped long lines, follow mode, 5k-line scrollback,
-  keyboard and mouse-wheel scrolling, log-level coloring (error / warn / debug)
-- **Live stats** — CPU + memory gauges with sparkline history (120 samples),
-  network I/O, pid count; computed the same way `docker stats` does
-  (page cache subtracted from memory usage)
-- **Diagnostics at a glance** — dead containers show their exit code in red,
-  OOM-killed ones get an `OOM` badge, restart loops (3+ deaths in 5 min) get
-  `↻loop`, failing healthchecks a red `✚`; the Info tab adds the failing
-  streak and the last probe outputs
-- **Events overlay** — `E` shows the last 500 daemon events (start / die /
-  oom / health…) with relative timestamps, so "why did it restart" has an
-  answer
-- **Inspect view** — status, health, command, restart policy, per-network IPs,
-  mounts, environment (env values masked by default, `x` reveals them)
-- **Related containers everywhere** — the detail pane for an image, volume or
-  network lists the containers using / mounting / attached to it
-- **Volume sizes** — real disk usage per volume from the `system/df` endpoint
-- **Batch actions** — mark rows with `space` (or `A` for all), remove everything
-  marked in one confirm; `D` wipes all listed containers / images / volumes /
-  networks at once (respects the active filter, requires an explicit `y`)
-- **One-key shell** — `e` drops you into `bash`/`sh` inside the selected
-  container and returns to the TUI when you exit
-- **Quick-win keys** — `y` yanks the row's name (`Y` its id) to the clipboard
-  via OSC 52, so it works over ssh and inside tmux with no clipboard tool;
-  `o` opens the container's first published port as `localhost:PORT` in the
-  browser; `K` kills with a chosen signal (TERM / KILL / HUP)
-- **Fuzzy filter** — `/` filters every panel by substring or subsequence; panel
-  titles show `shown/total` so hidden rows are never a surprise
-- **Sorting on every panel** — `,` cycles the sort column (state, name, image,
-  created, cpu, mem for containers; size, created, tag for images; …), `.`
-  reverses; the active sort shows in the panel title (`↓cpu`)
-- **Keyboard-first detail pane** — `Enter` focuses it, `j`/`k` scroll the logs,
-  `Esc` hops back to the panel list
-- **Mouse support** — click to select/focus, wheel to scroll, click detail tabs
-- **Destructive actions always confirm** — remove, prune, compose down; mass
-  deletes only accept `y`, a stray `Enter` cancels
-
-## Install
-
-### From source (recommended)
-
-Requires [Rust](https://rustup.rs) 1.85+ (edition 2024) and a running Docker daemon.
+You need a running Docker daemon and Rust 1.85 or newer.
 
 ```sh
 git clone https://github.com/preacherxp/super-docker.git
 cd super-docker
+cargo run --bin sd -- --no-update-check
+```
+
+Install it when you are ready to use it outside the repository:
+
+```sh
 cargo install --path .
-```
-
-This installs two identical binaries into `~/.cargo/bin`: `super-docker` and the
-short alias **`sd`**.
-
-### Straight from GitHub
-
-```sh
-cargo install --git https://github.com/preacherxp/super-docker
-```
-
-### Run it
-
-```sh
 sd
 ```
 
-That's it — no config file needed. Compose actions additionally require the
-[docker compose plugin](https://docs.docker.com/compose/install/) (detected at
-startup; everything else works without it).
+`cargo install` provides both `sd` and `super-docker`. The Docker Compose plugin
+is optional and only needed for Compose actions such as `up`, `down`, and
+`build`.
 
-### Finding the daemon
+## What it gives you
 
-`DOCKER_HOST` wins when set (`unix://` and `tcp://` both work). Otherwise the
-first socket that exists is used, so Docker Desktop, rootless Docker, Colima
-and Rancher Desktop all work out of the box:
+- Live containers, Compose projects, images, volumes, and networks in one TUI
+- Streaming logs, CPU and memory stats, inspect data, and Docker events
+- Start, stop, restart, pause, kill, exec, remove, prune, and batch actions
+- Compose project grouping and lifecycle actions
+- Fuzzy filtering, sorting, mouse support, and OSC 52 clipboard copy
+- Confirmations for destructive actions and persistent SQLite operation history
 
-```mermaid
-flowchart TD
-    A{"DOCKER_HOST set?"} -- "unix:// or tcp://" --> B([use it])
-    A -- no --> C["~/.docker/run/docker.sock<br/><i>Docker Desktop / rootless</i>"]
-    C -- missing --> D["~/.colima/default/docker.sock<br/><i>Colima</i>"]
-    D -- missing --> E["~/.rd/docker.sock<br/><i>Rancher Desktop</i>"]
-    E -- missing --> F["/var/run/docker.sock<br/><i>system daemon</i>"]
-    F -- missing --> G["$XDG_RUNTIME_DIR/docker.sock"]
-    C & D & E & F & G -- found --> B
-    G -- missing --> H([error: no docker socket found])
-```
-
-## Keys
+Press `?` in the app for the complete key map. The keys used most often are:
 
 | Key | Action |
 | --- | --- |
-| `j`/`k`, `↑`/`↓` | move selection (scrolls logs when the detail pane is focused) |
-| `Tab` / `Shift-Tab`, `1`–`5` | switch panel |
-| `Enter` / `l` | focus the detail pane |
-| `h` / `Esc` | focus back to the panel list |
-| `z` | zoom the focused pane to full screen |
-| `[` `]`, `←`/`→` | Logs / Stats / Info tab |
-| `/` | fuzzy filter (`Esc` clears) |
-| `space` / `A` | mark row / mark all (batch) |
-| `,` / `.` | cycle sort column / reverse direction |
-| `g` / `G` | jump to top / bottom (panel list; logs when detail focused) |
-| `y` / `Y` | yank name / id to clipboard (OSC 52 — works over ssh and tmux) |
-| `o` | open first published port as `localhost:PORT` in the browser |
-| `s` / `S` | stop / start container |
-| `r` | restart container |
-| `p` | pause / unpause |
-| `K` | kill with signal picker (TERM / KILL / HUP) |
-| `e` | exec shell into container |
-| `d` | remove selected or all marked (confirm) |
-| `D` | remove all listed rows in panel (only `y` confirms) |
-| `u` / `b` | compose up -d / build (Compose panel) |
-| `s` / `r` / `d` | compose stop / restart / down (Compose panel) |
-| `C` | prune stopped containers |
-| `P` | prune images / volumes |
-| `x` | show/hide env values in the Info tab |
-| `E` | docker events overlay (j/k scroll, Esc closes) |
-| `PgUp`/`PgDn`, wheel | scroll logs |
-| `f` | follow logs |
-| `w` | toggle log wrapping |
-| `Esc` | unfocus detail, then clear marks, then filter |
-| left click / wheel | select, focus, tabs, scroll |
-| `?` | help overlay |
-| `q`, `Ctrl-c` | quit |
-
-## How it works
-
-Everything is plain threads and one `mpsc` channel — no async runtime. Each
-background thread owns one HTTP stream to the daemon and pushes updates into
-the channel; the main loop is the only place that blocks, and it only redraws
-when something actually changed (bursts of daemon samples are batched into a
-single frame):
-
-```mermaid
-flowchart LR
-    subgraph daemon["Docker daemon (unix socket / tcp)"]
-        EV(["/events"])
-        ST(["/containers/·/stats"])
-        LG(["/containers/·/logs"])
-        DF(["/system/df"])
-    end
-
-    subgraph threads["background threads"]
-        EVT["events listener"]
-        STT["stats streams<br/>one per running container"]
-        LGT["log + inspect stream<br/>follows the selection"]
-        POLL["poll fallback<br/>containers 2s · rest 14s"]
-    end
-
-    IN["terminal input<br/>keys · mouse"]
-
-    EV --> EVT
-    ST --> STT
-    LG --> LGT
-    DF --> POLL
-
-    EVT -- mpsc --> LOOP{{"main loop"}}
-    STT -- mpsc --> LOOP
-    LGT -- mpsc --> LOOP
-    POLL -- mpsc --> LOOP
-    IN -- mpsc --> LOOP
-
-    LOOP --> APP["App state"]
-    APP --> UI["ratatui frame<br/>drawn only on change"]
-```
-
-A daemon event triggers a targeted refresh instead of a full poll — this is
-what makes state changes show up instantly:
-
-```mermaid
-sequenceDiagram
-    participant D as Docker daemon
-    participant E as events thread
-    participant M as main loop
-    participant T as terminal
-
-    D->>E: die  (id: web-1, exitCode: 137, oom: true)
-    E->>M: refresh containers
-    M->>D: GET /containers/json
-    D-->>M: updated container list
-    Note over M: recompute badges:<br/>exit code · OOM · ↻loop
-    M->>T: redraw (batched, ≤1 frame / 100ms)
-```
-
-- The HTTP client is ~350 lines: HTTP/1.1 over a unix or tcp socket, one
-  request per connection, Content-Length / chunked / read-to-EOF bodies.
-  Long-lived streams (events, stats, logs) are cancelled from another thread
-  by shutting down a clone of the socket.
-- Docker **events** trigger targeted refreshes; polling is only a slow
-  fallback (containers every 2s, images/volumes/networks every 14s)
-- One stats stream per running container, reconciled on every refresh
-- Log and inspect streams restart automatically when the selection changes
-- Compose projects are derived from container labels — the `docker compose`
-  binary is only invoked for `up` / `down` / `stop` / `restart` / `build`,
-  which have no daemon API
+| `j` / `k`, arrows | Move or scroll |
+| `Tab`, `Shift-Tab`, `1`–`5` | Change panel |
+| `Enter` / `Esc` | Focus / leave the detail pane |
+| `[` / `]` | Change detail tab |
+| `/` | Filter rows |
+| `space` / `A` | Mark one / all rows |
+| `s` / `S` / `r` | Stop / start / restart |
+| `e` | Open a shell in the selected container |
+| `d` | Remove selected or marked rows |
+| `E` / `O` | Docker events / operation history |
+| `?` / `q` | Help / quit |
 
 ## Development
 
 ```sh
-cargo test          # unit test suite (http framing, filter, stats math, batching, compose…)
+cargo test
 cargo build --release
 ```
 
-See [ROADMAP.md](ROADMAP.md) for planned features (image workflows, run wizard,
-config file, remote hosts).
+Run the development build with:
 
-## Requirements
+```sh
+cargo run --bin sd -- --no-update-check
+```
 
-- Docker daemon reachable via a local socket or `DOCKER_HOST`
-- `docker compose` plugin — optional, only for compose up/down/build
-- A terminal with mouse support (any modern one)
+The update check is disabled here so development runs are deterministic. A
+normal interactive `sd` launch checks stable GitHub tags and offers to install
+a newer release. Set `SUPER_DOCKER_NO_UPDATE_CHECK=1` to disable that behavior
+globally.
+
+### Record the terminal demo
+
+The README demo is generated with
+[VHS](https://github.com/charmbracelet/vhs). With Docker running:
+
+```sh
+brew install vhs # or use another installation method from the VHS project
+vhs demo.tape
+```
+
+The tape starts a temporary `nginx:alpine` container, records the real TUI to
+`docs/demo.gif`, and removes the container when it finishes.
+
+## Architecture
+
+The project deliberately uses plain threads and a single `mpsc` channel rather
+than an async runtime:
+
+```text
+terminal input ─┐
+Docker events ──┤
+stats streams ──┼─> main event loop ─> App state ─> ratatui frame
+logs/inspect ───┤
+slow fallback ──┘
+```
+
+- [`src/http.rs`](src/http.rs) is a small blocking HTTP/1.1 client for Unix and
+  TCP Docker sockets.
+- [`src/json.rs`](src/json.rs) contains the minimal JSON parser used for Engine
+  API responses.
+- [`src/docker.rs`](src/docker.rs) owns Engine API calls and background streams.
+- [`src/app.rs`](src/app.rs) contains application state, input handling, and
+  actions.
+- [`src/ui.rs`](src/ui.rs) renders the ratatui interface.
+- [`src/compose.rs`](src/compose.rs) groups Compose resources and invokes the
+  Compose CLI only for mutations unavailable through the Engine API.
+- [`src/operations.rs`](src/operations.rs) stores mutation history in SQLite.
+
+Docker events trigger targeted refreshes. Polling is only a fallback: containers
+refresh every 2 seconds and other resources every 14 seconds. Stats use one
+stream per running container; log and inspect streams follow the current
+selection.
+
+See [ROADMAP.md](ROADMAP.md) for planned work.
+
+## Runtime reference
+
+`DOCKER_HOST` takes precedence when set and supports `unix://` and `tcp://`.
+Otherwise `sd` checks the common Docker Desktop, Colima, Rancher Desktop,
+rootless Docker, and system socket locations.
+
+| Setting | Purpose |
+| --- | --- |
+| `DOCKER_HOST` | Select the Docker daemon |
+| `SUPER_DOCKER_NO_UPDATE_CHECK=1` | Disable update checks |
+| `SUPER_DOCKER_DB=/path/to/file.sqlite3` | Override the history database path |
+| `XDG_STATE_HOME` | Change the base state directory |
+
+Use `sd --history` to print the latest operation records without starting the
+TUI. By default they are stored in
+`$XDG_STATE_HOME/super-docker/operations.sqlite3`, or
+`~/.local/state/super-docker/operations.sqlite3` when `XDG_STATE_HOME` is not
+set. Passive reads are not recorded.

@@ -99,7 +99,9 @@ pub struct Response {
 impl Response {
     /// Clone of the underlying socket, for aborting a stream mid-read.
     pub fn aborter(&self) -> io::Result<Aborter> {
-        Ok(Aborter { stream: self.reader.get_ref().try_clone()? })
+        Ok(Aborter {
+            stream: self.reader.get_ref().try_clone()?,
+        })
     }
 
     pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
@@ -148,7 +150,11 @@ impl Response {
             let line = text.trim().to_owned();
             self.line_buf.clear();
             self.line_start = 0;
-            return if line.is_empty() { Ok(None) } else { Ok(Some(line)) };
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
         }
     }
 
@@ -171,9 +177,15 @@ impl Response {
                     break;
                 }
             }
-            self.body = BodyKind::Chunked { remaining: 0, done: true };
+            self.body = BodyKind::Chunked {
+                remaining: 0,
+                done: true,
+            };
         } else {
-            self.body = BodyKind::Chunked { remaining: size, done: false };
+            self.body = BodyKind::Chunked {
+                remaining: size,
+                done: false,
+            };
         }
         Ok(())
     }
@@ -204,7 +216,10 @@ impl Read for Response {
                         "chunk cut short",
                     ));
                 }
-                self.body = BodyKind::Chunked { remaining: remaining - n as u64, done: false };
+                self.body = BodyKind::Chunked {
+                    remaining: remaining - n as u64,
+                    done: false,
+                };
                 Ok(n)
             }
         }
@@ -221,11 +236,18 @@ fn connect(t: &Transport) -> io::Result<Stream> {
 /// One HTTP request on a fresh connection. `path` includes the query string.
 /// Bodyless requests only — every Docker call this app makes sends no body.
 pub fn request(t: &Transport, method: &str, path: &str) -> io::Result<Response> {
-    let mut stream = connect(t)?;
+    request_stream(connect(t)?, method, path)
+}
+
+fn request_stream(mut stream: Stream, method: &str, path: &str) -> io::Result<Response> {
     // Host is required by HTTP/1.1; the daemon ignores its value on unix
     // sockets. Connection: close keeps EOF-framed bodies finite; streaming
     // (chunked) endpoints are unaffected — they end when we drop the socket.
-    let content_length = if method == "GET" { "" } else { "Content-Length: 0\r\n" };
+    let content_length = if method == "GET" {
+        ""
+    } else {
+        "Content-Length: 0\r\n"
+    };
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\nConnection: close\r\n{content_length}\r\n"
     );
@@ -239,7 +261,12 @@ pub fn request(t: &Transport, method: &str, path: &str) -> io::Result<Response> 
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("bad status line: {line:?}")))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad status line: {line:?}"),
+            )
+        })?;
 
     let mut content_type = String::new();
     let mut content_length: Option<u64> = None;
@@ -247,7 +274,10 @@ pub fn request(t: &Transport, method: &str, path: &str) -> io::Result<Response> 
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "headers cut short"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "headers cut short",
+            ));
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -267,7 +297,10 @@ pub fn request(t: &Transport, method: &str, path: &str) -> io::Result<Response> 
     let body = if status == 204 || status == 304 {
         BodyKind::Length(0)
     } else if chunked {
-        BodyKind::Chunked { remaining: 0, done: false }
+        BodyKind::Chunked {
+            remaining: 0,
+            done: false,
+        }
     } else if let Some(n) = content_length {
         BodyKind::Length(n)
     } else {
@@ -289,33 +322,30 @@ pub fn request(t: &Transport, method: &str, path: &str) -> io::Result<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
 
-    /// Spin up a unix-socket server that answers one request with `reply`.
-    fn serve(reply: &'static str) -> Transport {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "sd-http-test-{}-{:p}.sock",
-            std::process::id(),
-            reply.as_ptr()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).unwrap();
+    /// Answer one request through a connected socket pair. This exercises the
+    /// complete wire protocol without binding a port or filesystem socket,
+    /// which also works in network-isolated CI sandboxes.
+    fn exchange(reply: &'static str, method: &str) -> Response {
+        try_exchange(reply, method).unwrap()
+    }
+
+    fn try_exchange(reply: &'static str, method: &str) -> io::Result<Response> {
+        let (client, mut server) = UnixStream::pair().unwrap();
         std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                // read request head
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf);
-                let _ = sock.write_all(reply.as_bytes());
-            }
+            let mut buf = [0u8; 4096];
+            let _ = server.read(&mut buf);
+            let _ = server.write_all(reply.as_bytes());
         });
-        Transport::Unix(path)
+        request_stream(Stream::Unix(client), method, "/x")
     }
 
     #[test]
     fn content_length_body() {
-        let t = serve("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\nhello");
-        let mut r = request(&t, "GET", "/x").unwrap();
+        let mut r = exchange(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+        );
         assert_eq!(r.status, 200);
         assert_eq!(r.content_type, "application/json");
         assert_eq!(r.read_all().unwrap(), b"hello");
@@ -323,19 +353,19 @@ mod tests {
 
     #[test]
     fn chunked_body() {
-        let t = serve(
+        let mut r = exchange(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+            "GET",
         );
-        let mut r = request(&t, "GET", "/x").unwrap();
         assert_eq!(r.read_all().unwrap(), b"hello world");
     }
 
     #[test]
     fn chunked_ndjson_lines() {
-        let t = serve(
+        let mut r = exchange(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n{\"a\":1}\n\r\n8\r\n{\"b\":2}\n\r\n0\r\n\r\n",
+            "GET",
         );
-        let mut r = request(&t, "GET", "/x").unwrap();
         assert_eq!(r.read_line().unwrap().as_deref(), Some("{\"a\":1}"));
         assert_eq!(r.read_line().unwrap().as_deref(), Some("{\"b\":2}"));
         assert_eq!(r.read_line().unwrap(), None);
@@ -343,19 +373,75 @@ mod tests {
 
     #[test]
     fn no_content_status_has_empty_body() {
-        let t = serve("HTTP/1.1 204 No Content\r\n\r\n");
-        let mut r = request(&t, "POST", "/x").unwrap();
+        let mut r = exchange("HTTP/1.1 204 No Content\r\n\r\n", "POST");
         assert_eq!(r.status, 204);
         assert_eq!(r.read_all().unwrap(), b"");
     }
 
     #[test]
     fn error_status_body_readable() {
-        let t = serve(
+        let mut r = exchange(
             "HTTP/1.1 404 Not Found\r\nContent-Length: 25\r\n\r\n{\"message\":\"no such ctr\"}",
+            "GET",
         );
-        let mut r = request(&t, "GET", "/x").unwrap();
         assert_eq!(r.status, 404);
         assert_eq!(r.read_all().unwrap(), br#"{"message":"no such ctr"}"#);
+    }
+
+    #[test]
+    fn eof_framed_body_and_partial_final_line() {
+        let mut r = exchange(
+            "HTTP/1.1 200 OK\r\nX-Ignored: yes\r\n\r\n\n first \nlast",
+            "GET",
+        );
+        assert_eq!(r.read_line().unwrap().as_deref(), Some("first"));
+        assert_eq!(r.read_line().unwrap().as_deref(), Some("last"));
+        assert_eq!(r.read_line().unwrap(), None);
+    }
+
+    #[test]
+    fn chunk_extensions_and_trailers_are_consumed() {
+        let mut r = exchange(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: ChUnKeD\r\n\r\n5;ext=x\r\nhello\r\n0\r\nChecksum: ok\r\n\r\n",
+            "GET",
+        );
+        assert_eq!(r.read_all().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn malformed_and_truncated_responses_fail_cleanly() {
+        let bad_status = try_exchange("not-http\r\n\r\n", "GET").err().unwrap();
+        assert_eq!(bad_status.kind(), io::ErrorKind::InvalidData);
+        let cut_headers = try_exchange("HTTP/1.1 200 OK\r\nHeader: value", "GET")
+            .err()
+            .unwrap();
+        assert_eq!(cut_headers.kind(), io::ErrorKind::UnexpectedEof);
+
+        let mut bad_size = exchange(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nnope\r\n",
+            "GET",
+        );
+        assert_eq!(
+            bad_size.read_all().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut cut = exchange(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi",
+            "GET",
+        );
+        assert_eq!(
+            cut.read_all().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn not_modified_ignores_declared_body() {
+        let mut r = exchange(
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+        );
+        assert_eq!(r.read_all().unwrap(), b"");
     }
 }

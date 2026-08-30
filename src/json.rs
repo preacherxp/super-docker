@@ -78,7 +78,11 @@ impl Value {
 }
 
 pub fn parse(input: &str) -> Result<Value, String> {
-    let mut p = Parser { b: input.as_bytes(), i: 0, depth: 0 };
+    let mut p = Parser {
+        b: input.as_bytes(),
+        i: 0,
+        depth: 0,
+    };
     p.skip_ws();
     let v = p.value()?;
     p.skip_ws();
@@ -229,10 +233,15 @@ impl<'a> Parser<'a> {
                                     self.i += 1;
                                     self.eat(b'u')?;
                                     let lo = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&lo) {
+                                        return Err("invalid surrogate pair".into());
+                                    }
                                     0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                                 } else {
                                     return Err("lone surrogate".into());
                                 }
+                            } else if (0xDC00..0xE000).contains(&hi) {
+                                return Err("lone surrogate".into());
                             } else {
                                 hi
                             };
@@ -241,7 +250,10 @@ impl<'a> Parser<'a> {
                         _ => return Err(format!("bad escape at byte {}", self.i)),
                     }
                 }
-                Some(_) => {
+                Some(c) => {
+                    if c < 0x20 {
+                        return Err("unescaped control character".into());
+                    }
                     // consume one utf-8 code point untouched
                     let start = self.i;
                     self.i += 1;
@@ -249,8 +261,7 @@ impl<'a> Parser<'a> {
                         self.i += 1;
                     }
                     s.push_str(
-                        std::str::from_utf8(&self.b[start..self.i])
-                            .map_err(|_| "invalid utf-8")?,
+                        std::str::from_utf8(&self.b[start..self.i]).map_err(|_| "invalid utf-8")?,
                     );
                 }
             }
@@ -273,15 +284,40 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'-') {
             self.i += 1;
         }
-        let mut float = false;
-        while let Some(c) = self.peek() {
-            match c {
-                b'0'..=b'9' => self.i += 1,
-                b'.' | b'e' | b'E' | b'+' | b'-' => {
-                    float = true;
+        match self.peek() {
+            Some(b'0') => self.i += 1,
+            Some(b'1'..=b'9') => {
+                self.i += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
                     self.i += 1;
                 }
-                _ => break,
+            }
+            _ => return Err(format!("bad number at byte {start}")),
+        }
+        let mut float = false;
+        if self.peek() == Some(b'.') {
+            float = true;
+            self.i += 1;
+            let fraction = self.i;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+            if self.i == fraction {
+                return Err(format!("bad number at byte {start}"));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            float = true;
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            let exponent = self.i;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+            if self.i == exponent {
+                return Err(format!("bad number at byte {start}"));
             }
         }
         let s = std::str::from_utf8(&self.b[start..self.i]).unwrap();
@@ -291,8 +327,10 @@ impl<'a> Parser<'a> {
             }
         }
         s.parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
             .map(Value::Float)
-            .map_err(|_| format!("bad number at byte {start}"))
+            .ok_or_else(|| format!("bad number at byte {start}"))
     }
 }
 
@@ -335,7 +373,9 @@ mod tests {
         let v = parse(r#"{"a": [1, {"b": "x"}], "c": null, "d": {} }"#).unwrap();
         assert_eq!(v.get("a").unwrap().as_array().unwrap()[0].as_i64(), Some(1));
         assert_eq!(
-            v.get("a").unwrap().as_array().unwrap()[1].str_of("b").as_deref(),
+            v.get("a").unwrap().as_array().unwrap()[1]
+                .str_of("b")
+                .as_deref(),
             Some("x")
         );
         assert_eq!(v.get("c"), Some(&Value::Null));
@@ -344,7 +384,10 @@ mod tests {
 
     #[test]
     fn unicode_passthrough() {
-        assert_eq!(parse("\"zażółć 😀\"").unwrap(), Value::Str("zażółć 😀".into()));
+        assert_eq!(
+            parse("\"zażółć 😀\"").unwrap(),
+            Value::Str("zażółć 😀".into())
+        );
     }
 
     #[test]
@@ -355,6 +398,58 @@ mod tests {
         assert!(parse("{\"a\" 1}").is_err());
         assert!(parse("1 2").is_err());
         assert!(parse("\"abc").is_err());
+    }
+
+    #[test]
+    fn rejects_every_malformed_number_and_string_branch() {
+        for invalid in [
+            "-",
+            "01",
+            "1.",
+            "1e",
+            "1e+",
+            "+1",
+            ".1",
+            "1e9999",
+            "\"\\x\"",
+            "\"\\u12\"",
+            "\"\\uD800\"",
+            "\"\\uD800\\u0041\"",
+            "\"\\uDC00\"",
+            "\"line\nfeed\"",
+        ] {
+            assert!(
+                parse(invalid).is_err(),
+                "accepted invalid JSON: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accessors_reject_wrong_variants_and_negative_unsigned_values() {
+        let values = [Value::Null, Value::Bool(false)];
+        for value in values {
+            assert_eq!(value.as_str(), None);
+            assert_eq!(value.as_i64(), None);
+            assert_eq!(value.as_u64(), None);
+            assert_eq!(value.as_array(), None);
+            assert_eq!(value.as_object(), None);
+            assert_eq!(value.get("x"), None);
+        }
+        let string = Value::Str("x".into());
+        assert_eq!(string.as_str(), Some("x"));
+        assert_eq!(string.as_i64(), None);
+        assert_eq!(string.as_array(), None);
+        assert_eq!(Value::Int(-1).as_u64(), None);
+        assert_eq!(Value::Float(-1.0).as_u64(), None);
+        assert_eq!(Value::Float(2.9).as_i64(), Some(2));
+    }
+
+    #[test]
+    fn integer_property_holds_across_representative_range() {
+        for number in (-100_000_i64..=100_000).step_by(997) {
+            assert_eq!(parse(&number.to_string()).unwrap().as_i64(), Some(number));
+        }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -5,11 +6,10 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Scrollbar, ScrollbarState,
     Sparkline, Table, TableState, Tabs, Wrap,
 };
-use ratatui::Frame;
 
 use crate::app::{
-    ago, exit_code_from_status, health_from_status, human_bytes, unix_now, App, ContainerRow,
-    DetailTab, Focus, HealthState, Mode, Panel, RowState, PANEL_ORDER,
+    App, ContainerRow, DetailTab, Focus, HealthState, LogEntry, LogLevel, Mode, PANEL_ORDER, Panel,
+    RowState, VisualLogRow, ago, exit_code_from_status, health_from_status, human_bytes, unix_now,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -27,7 +27,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(5), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
@@ -71,10 +75,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Help => draw_help(f),
         Mode::Events => draw_events(f, app),
-        Mode::Confirm(action) => {
-            draw_confirm(f, &action.describe(), action.needs_explicit_yes())
-        }
+        Mode::Operations => draw_operations(f, app),
+        Mode::Confirm(action) => draw_confirm(f, &action.describe(), action.needs_explicit_yes()),
         Mode::Signal(_, name) => draw_signal(f, name),
+        Mode::Update(version, _) => draw_update(f, version),
         _ => {}
     }
 }
@@ -118,7 +122,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     ];
     if let Some(err) = &app.docker_err {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!("⚠ {err}"), Style::default().fg(Color::Red)));
+        spans.push(Span::styled(
+            format!("⚠ {err}"),
+            Style::default().fg(Color::Red),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -155,7 +162,14 @@ fn panel_block(title: String, focused: bool) -> Block<'static> {
 
 /// Shows `shown/total` when a filter hides rows, so unfocused panels
 /// don't silently change counts. `sort` is the `↓name`-style indicator.
-fn panel_title(num: usize, name: &str, shown: usize, total: usize, marked: usize, sort: &str) -> String {
+fn panel_title(
+    num: usize,
+    name: &str,
+    shown: usize,
+    total: usize,
+    marked: usize,
+    sort: &str,
+) -> String {
     let count = if shown == total {
         format!("{shown}")
     } else {
@@ -262,7 +276,9 @@ fn render_table(
     // border + header consume three vertical cells in total.
     let viewport_len = area.height.saturating_sub(3) as usize;
     let highlight = if focused {
-        Style::default().bg(Color::Rgb(30, 50, 60)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Rgb(30, 50, 60))
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
@@ -306,15 +322,16 @@ fn container_badges(app: &App, c: &ContainerRow, now: i64) -> Vec<Span<'static>>
         spans.push(Span::styled(" OOM", Style::default().fg(Color::Red).bold()));
     }
     if app.restart_looping(&c.id, now) {
-        spans.push(Span::styled(" ↻loop", Style::default().fg(Color::Yellow).bold()));
+        spans.push(Span::styled(
+            " ↻loop",
+            Style::default().fg(Color::Yellow).bold(),
+        ));
     }
     match health_from_status(&c.status) {
         HealthState::Unhealthy => {
             spans.push(Span::styled(" ✚", Style::default().fg(Color::Red).bold()))
         }
-        HealthState::Starting => {
-            spans.push(Span::styled(" ✚", Style::default().fg(Color::Yellow)))
-        }
+        HealthState::Starting => spans.push(Span::styled(" ✚", Style::default().fg(Color::Yellow))),
         _ => {}
     }
     spans
@@ -343,8 +360,12 @@ fn draw_containers_panel(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|c| {
             let stats = app.stats.get(&c.id).and_then(|h| h.last.as_ref());
-            let cpu = stats.map(|s| format!("{:.0}%", s.cpu_pct)).unwrap_or_else(|| "-".into());
-            let mem = stats.map(|s| format!("{:.0}%", s.mem_pct)).unwrap_or_else(|| "-".into());
+            let cpu = stats
+                .map(|s| format!("{:.0}%", s.cpu_pct))
+                .unwrap_or_else(|| "-".into());
+            let mem = stats
+                .map(|s| format!("{:.0}%", s.mem_pct))
+                .unwrap_or_else(|| "-".into());
             let mut name_spans = vec![
                 state_dot(c.state),
                 mark_span(marked.contains(&c.id)),
@@ -368,7 +389,11 @@ fn draw_containers_panel(f: &mut Frame, app: &mut App, area: Rect) {
         rows,
         content_len,
         content_offset,
-        &[Constraint::Fill(1), Constraint::Length(5), Constraint::Length(5)],
+        &[
+            Constraint::Fill(1),
+            Constraint::Length(5),
+            Constraint::Length(5),
+        ],
         focused,
     );
 }
@@ -579,29 +604,57 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
                     }))
                 })
                 .unwrap_or_default();
-            draw_kv_detail(f, app, area, " Image ", image_kv(app), "containers using image", related);
+            draw_kv_detail(
+                f,
+                app,
+                area,
+                " Image ",
+                image_kv(app),
+                "containers using image",
+                related,
+            );
         }
         Panel::Volumes => {
             let related = app
                 .selected_volume()
                 .map(|v| {
                     related_lines(
-                        app.containers.iter().filter(|c| c.volumes.contains(&v.name)),
+                        app.containers
+                            .iter()
+                            .filter(|c| c.volumes.contains(&v.name)),
                     )
                 })
                 .unwrap_or_default();
-            draw_kv_detail(f, app, area, " Volume ", volume_kv(app), "containers mounting", related);
+            draw_kv_detail(
+                f,
+                app,
+                area,
+                " Volume ",
+                volume_kv(app),
+                "containers mounting",
+                related,
+            );
         }
         Panel::Networks => {
             let related = app
                 .selected_network()
                 .map(|n| {
                     related_lines(
-                        app.containers.iter().filter(|c| c.networks.contains(&n.name)),
+                        app.containers
+                            .iter()
+                            .filter(|c| c.networks.contains(&n.name)),
                     )
                 })
                 .unwrap_or_default();
-            draw_kv_detail(f, app, area, " Network ", network_kv(app), "containers attached", related);
+            draw_kv_detail(
+                f,
+                app,
+                area,
+                " Network ",
+                network_kv(app),
+                "containers attached",
+                related,
+            );
         }
     }
 }
@@ -658,7 +711,11 @@ fn draw_compose_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let table = Table::new(
         rows,
-        [Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)],
+        [
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ],
     )
     .header(Row::new(vec!["service", "status", "ports"]).style(Style::default().fg(DIM)));
     f.render_widget(table, chunks[0]);
@@ -667,7 +724,9 @@ fn draw_compose_detail(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn image_kv(app: &App) -> Vec<(String, String)> {
-    let Some(i) = app.selected_image() else { return vec![] };
+    let Some(i) = app.selected_image() else {
+        return vec![];
+    };
     vec![
         ("Tag".into(), i.tag.clone()),
         ("ID".into(), i.id.clone()),
@@ -678,7 +737,9 @@ fn image_kv(app: &App) -> Vec<(String, String)> {
 }
 
 fn volume_kv(app: &App) -> Vec<(String, String)> {
-    let Some(v) = app.selected_volume() else { return vec![] };
+    let Some(v) = app.selected_volume() else {
+        return vec![];
+    };
     let size = match app.volume_sizes.get(&v.name) {
         Some(s) if *s >= 0 => human_bytes(*s as u64),
         _ => "unknown".into(),
@@ -693,7 +754,9 @@ fn volume_kv(app: &App) -> Vec<(String, String)> {
 }
 
 fn network_kv(app: &App) -> Vec<(String, String)> {
-    let Some(n) = app.selected_network() else { return vec![] };
+    let Some(n) = app.selected_network() else {
+        return vec![];
+    };
     vec![
         ("Name".into(), n.name.clone()),
         ("ID".into(), n.id.chars().take(12).collect()),
@@ -813,47 +876,88 @@ fn mask_env(v: &str) -> String {
     }
 }
 
-fn log_line_style(line: &str) -> Style {
-    let lower = line.to_lowercase();
-    if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
-        Style::default().fg(Color::Red)
-    } else if lower.contains("warn") {
-        Style::default().fg(Color::Yellow)
-    } else if lower.contains("debug") || lower.contains("trace") {
-        Style::default().fg(DIM)
-    } else {
-        Style::default()
+fn log_level_style(level: LogLevel) -> Style {
+    match level {
+        LogLevel::Error => Style::default().fg(Color::Red),
+        LogLevel::Warn => Style::default().fg(Color::Yellow),
+        LogLevel::Debug => Style::default().fg(DIM),
+        LogLevel::Normal => Style::default(),
     }
 }
 
-/// Convert raw Docker log entries to terminal rows. Logs are hard-wrapped
-/// instead of word-wrapped so long JSON values and identifiers cannot spill
-/// outside the detail pane. Ratatui's grapheme iterator keeps emoji, combining
-/// characters, and double-width glyphs intact without another dependency.
-fn visual_log_lines(logs: &[String], width: usize, wrap: bool) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    for log in logs {
-        let style = log_line_style(log);
-        if !wrap || width == 0 {
-            rows.push(Line::from(Span::styled(log.clone(), style)));
-            continue;
-        }
+#[cfg(test)]
+fn log_line_style(line: &str) -> Style {
+    log_level_style(LogLevel::classify(line))
+}
 
-        let source = Span::raw(log.as_str());
-        let mut row = String::new();
-        let mut row_width: usize = 0;
-        for grapheme in source.styled_graphemes(Style::default()) {
-            let grapheme_width = Span::raw(grapheme.symbol).width();
-            if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
-                rows.push(Line::from(Span::styled(std::mem::take(&mut row), style)));
-                row_width = 0;
-            }
-            row.push_str(grapheme.symbol);
-            row_width = row_width.saturating_add(grapheme_width);
-        }
-        rows.push(Line::from(Span::styled(row, style)));
+fn append_visual_rows(
+    rows: &mut std::collections::VecDeque<VisualLogRow>,
+    entry: &LogEntry,
+    width: usize,
+    wrap: bool,
+) {
+    if !wrap || width == 0 {
+        rows.push_back(VisualLogRow {
+            seq: entry.seq,
+            text: entry.text.clone(),
+            level: entry.level,
+        });
+        return;
     }
-    rows
+
+    let source = Span::raw(entry.text.as_str());
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for grapheme in source.styled_graphemes(Style::default()) {
+        let grapheme_width = Span::raw(grapheme.symbol).width();
+        if row_width > 0 && row_width.saturating_add(grapheme_width) > width {
+            rows.push_back(VisualLogRow {
+                seq: entry.seq,
+                text: std::mem::take(&mut row),
+                level: entry.level,
+            });
+            row_width = 0;
+        }
+        row.push_str(grapheme.symbol);
+        row_width = row_width.saturating_add(grapheme_width);
+    }
+    rows.push_back(VisualLogRow {
+        seq: entry.seq,
+        text: row,
+        level: entry.level,
+    });
+}
+
+/// Incrementally synchronize wrapped rows with the append-only log ring.
+/// Eviction drops cached rows by sequence; resize/wrap changes rebuild once.
+fn sync_log_render_cache(app: &mut App, width: usize, wrap: bool) {
+    let cache = &mut app.log_render_cache;
+    if !cache.configured || cache.width != width || cache.wrap != wrap {
+        cache.rows.clear();
+        cache.last_seq = None;
+        cache.width = width;
+        cache.wrap = wrap;
+        cache.configured = true;
+    }
+
+    let Some(first_seq) = app.logs.front().map(|entry| entry.seq) else {
+        cache.rows.clear();
+        cache.last_seq = None;
+        return;
+    };
+    while cache.rows.front().is_some_and(|row| row.seq < first_seq) {
+        cache.rows.pop_front();
+    }
+
+    let last_cached = cache.last_seq;
+    for entry in app
+        .logs
+        .iter()
+        .filter(|entry| last_cached.is_none_or(|seq| entry.seq > seq))
+    {
+        append_visual_rows(&mut cache.rows, entry, width, wrap);
+    }
+    cache.last_seq = app.logs.back().map(|entry| entry.seq);
 }
 
 fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
@@ -871,8 +975,8 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let text_area = columns[0];
     let scrollbar_area = columns[1];
     let h = text_area.height as usize;
-    let mut lines = visual_log_lines(&app.logs, text_area.width as usize, app.wrap_logs);
-    let len = lines.len();
+    sync_log_render_cache(app, text_area.width as usize, app.wrap_logs);
+    let len = app.log_render_cache.rows.len();
     let max_scroll = len.saturating_sub(h);
     let start = if app.follow {
         max_scroll
@@ -905,17 +1009,22 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
         )
     };
     f.render_widget(block.title(mode), area);
-    let visible = if start < end {
-        lines.drain(start..end).collect()
-    } else {
-        Vec::new()
-    };
+    let visible: Vec<Line<'static>> = app
+        .log_render_cache
+        .rows
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|row| Line::from(Span::styled(row.text.clone(), log_level_style(row.level))))
+        .collect();
     f.render_widget(Paragraph::new(Text::from(visible)), text_area);
     render_scrollbar(f, scrollbar_area, len, h, start);
 }
 
 fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
-    let Some(c) = app.selected_container() else { return };
+    let Some(c) = app.selected_container() else {
+        return;
+    };
     let Some(hist) = app.stats.get(&c.id) else {
         f.render_widget(
             Paragraph::new("waiting for live stats — the container may not be running")
@@ -926,7 +1035,9 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     };
-    let Some(last) = hist.last.as_ref() else { return };
+    let Some(last) = hist.last.as_ref() else {
+        return;
+    };
 
     if area.width < 52 || area.height < 13 {
         draw_stats_compact(f, area, c, last);
@@ -1102,7 +1213,11 @@ fn draw_stats_compact(
     sample: &crate::app::StatSample,
 ) {
     let ports = if c.ports.is_empty() { "-" } else { &c.ports };
-    let cpu_unit = if sample.cpu_cores == 1 { "core" } else { "cores" };
+    let cpu_unit = if sample.cpu_cores == 1 {
+        "core"
+    } else {
+        "cores"
+    };
     let memory = if sample.mem_limit == 0 {
         human_bytes(sample.mem_used)
     } else {
@@ -1115,7 +1230,10 @@ fn draw_stats_compact(
     let lines = vec![
         Line::from(vec![
             Span::styled("CPU  ", Style::default().fg(Color::Magenta).bold()),
-            Span::raw(format!("{:.1}% · {} {cpu_unit}", sample.cpu_pct, sample.cpu_cores)),
+            Span::raw(format!(
+                "{:.1}% · {} {cpu_unit}",
+                sample.cpu_pct, sample.cpu_cores
+            )),
         ]),
         Line::from(vec![
             Span::styled("MEM  ", Style::default().fg(Color::Blue).bold()),
@@ -1293,6 +1411,16 @@ fn draw_signal(f: &mut Frame, name: &str) {
     );
 }
 
+fn draw_update(f: &mut Frame, version: &str) {
+    draw_modal(
+        f,
+        " update ",
+        Color::Green,
+        &format!("super-docker v{version} is available"),
+        "y/Enter install · any other key later",
+    );
+}
+
 fn draw_help(f: &mut Frame) {
     let keys: &[(&str, &str)] = &[
         ("j/k ↑/↓", "move selection / scroll detail"),
@@ -1321,6 +1449,7 @@ fn draw_help(f: &mut Frame) {
         ("d (compose)", "compose down (confirm)"),
         ("x", "show/hide env values (Info tab)"),
         ("E", "docker events overlay"),
+        ("O", "persistent operation history"),
         ("mouse", "click select/focus/tabs, wheel scroll"),
         ("PgUp/PgDn", "scroll logs"),
         ("f", "follow logs"),
@@ -1350,7 +1479,12 @@ fn draw_help(f: &mut Frame) {
             Style::default().fg(DIM),
         ))))
         .collect();
-    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn event_action_color(action: &str) -> Color {
@@ -1407,7 +1541,9 @@ fn draw_events(f: &mut Frame, app: &App) {
         .collect();
     if lines.is_empty() {
         f.render_widget(
-            Paragraph::new("no docker events yet").style(Style::default().fg(DIM)).block(block),
+            Paragraph::new("no docker events yet")
+                .style(Style::default().fg(DIM))
+                .block(block),
             area,
         );
     } else {
@@ -1421,14 +1557,95 @@ fn draw_events(f: &mut Frame, app: &App) {
     }
 }
 
+fn operation_status_color(status: &str) -> Color {
+    match status {
+        "succeeded" => Color::Green,
+        "failed" | "interrupted" => Color::Red,
+        "running" => Color::Yellow,
+        _ => DIM,
+    }
+}
+
+fn draw_operations(f: &mut Frame, app: &App) {
+    let w = f.area().width.saturating_sub(6).min(120);
+    let h = f.area().height.saturating_sub(4);
+    let area = centered(f.area(), w, h);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(format!(
+            " operations ({}) · latest first ",
+            app.operations.len()
+        ))
+        .title_bottom(
+            Line::from(Span::styled(
+                " j/k scroll · g/G ends · R refresh · Esc close ",
+                Style::default().fg(DIM),
+            ))
+            .alignment(Alignment::Right),
+        );
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let start = app
+        .operations_scroll
+        .min(app.operations.len().saturating_sub(1));
+    let end = (start + inner_h).min(app.operations.len());
+    let lines: Vec<Line> = app.operations[start..end]
+        .iter()
+        .map(|operation| {
+            let error = if operation.error.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", operation.error.replace('\n', " "))
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>8}  ", ago(operation.started_at)),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(
+                    format!("{:<11} ", operation.status),
+                    Style::default().fg(operation_status_color(&operation.status)),
+                ),
+                Span::styled(
+                    format!("{:<10} ", operation.resource),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(
+                    format!("{:<12} ", operation.action),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::raw(format!("{}{}", operation.target, error)),
+            ])
+        })
+        .collect();
+    if lines.is_empty() {
+        f.render_widget(
+            Paragraph::new("no operations recorded yet")
+                .style(Style::default().fg(DIM))
+                .block(block),
+            area,
+        );
+    } else {
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+        let scrollbar_area = Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(2),
+            ..area
+        };
+        render_scrollbar(f, scrollbar_area, app.operations.len(), inner_h, start);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn rendered_app() -> App {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
         std::mem::forget(rx);
         App::new(crate::docker::Docker::dummy(), tx)
     }
@@ -1460,7 +1677,14 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let collapsed = app.layout.panels[Panel::Images as usize];
         assert_eq!(collapsed.height, COLLAPSED_PANEL_H);
-        assert!(terminal.backend().buffer().content().iter().any(|c| c.symbol() == "█"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|c| c.symbol() == "█")
+        );
 
         app.on_mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1472,7 +1696,10 @@ mod tests {
 
         assert_eq!(app.panel, Panel::Images);
         assert!(app.layout.panels[Panel::Images as usize].height > COLLAPSED_PANEL_H);
-        assert_eq!(app.layout.panels[Panel::Containers as usize].height, COLLAPSED_PANEL_H);
+        assert_eq!(
+            app.layout.panels[Panel::Containers as usize].height,
+            COLLAPSED_PANEL_H
+        );
     }
 
     #[test]
@@ -1532,7 +1759,10 @@ mod tests {
 
     #[test]
     fn panel_title_with_and_without_marks() {
-        assert_eq!(panel_title(3, "Images", 12, 12, 0, "↓created"), " [3] Images (12) ↓created ");
+        assert_eq!(
+            panel_title(3, "Images", 12, 12, 0, "↓created"),
+            " [3] Images (12) ↓created "
+        );
         assert_eq!(
             panel_title(3, "Images", 12, 12, 4, "↓created"),
             " [3] Images (12 · 4✓) ↓created "
@@ -1541,8 +1771,14 @@ mod tests {
 
     #[test]
     fn panel_title_shows_filtered_counts() {
-        assert_eq!(panel_title(3, "Images", 4, 12, 0, "↑tag"), " [3] Images (4/12) ↑tag ");
-        assert_eq!(panel_title(3, "Images", 4, 12, 2, "↑tag"), " [3] Images (4/12 · 2✓) ↑tag ");
+        assert_eq!(
+            panel_title(3, "Images", 4, 12, 0, "↑tag"),
+            " [3] Images (4/12) ↑tag "
+        );
+        assert_eq!(
+            panel_title(3, "Images", 4, 12, 2, "↑tag"),
+            " [3] Images (4/12 · 2✓) ↑tag "
+        );
     }
 
     #[test]
@@ -1565,7 +1801,7 @@ mod tests {
     #[test]
     fn wrapped_logs_scroll_by_visual_rows() {
         let mut app = rendered_app();
-        app.logs = vec!["abcdefghijklmnopqrstuv".into()];
+        app.set_logs_for_test(["abcdefghijklmnopqrstuv".into()]);
         let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
 
         terminal.draw(|f| draw_logs(f, &mut app, f.area())).unwrap();
@@ -1592,11 +1828,16 @@ mod tests {
 
     #[test]
     fn wrapping_preserves_wide_graphemes() {
-        let logs = vec!["ab🙂cd".to_string()];
-        let rows = visual_log_lines(&logs, 4, true);
+        let entry = LogEntry {
+            seq: 0,
+            text: "ab🙂cd".to_string(),
+            level: LogLevel::Normal,
+        };
+        let mut rows = std::collections::VecDeque::new();
+        append_visual_rows(&mut rows, &entry, 4, true);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].to_string(), "ab🙂");
-        assert_eq!(rows[1].to_string(), "cd");
+        assert_eq!(rows[0].text, "ab🙂");
+        assert_eq!(rows[1].text, "cd");
     }
 
     #[test]
@@ -1623,5 +1864,67 @@ mod tests {
         assert_eq!(event_action_color("start"), Color::Green);
         assert_eq!(event_action_color("stop"), Color::Yellow);
         assert_eq!(event_action_color("attach"), DIM);
+    }
+
+    #[test]
+    fn every_panel_detail_and_modal_renders_at_compact_and_wide_sizes() {
+        let modes = [
+            Mode::Normal,
+            Mode::Filter,
+            Mode::Help,
+            Mode::Events,
+            Mode::Operations,
+            Mode::Confirm(crate::app::ConfirmAction::PruneImages),
+            Mode::Signal("id".into(), "api".into()),
+            Mode::Update("9.8.7".into(), "v9.8.7".into()),
+        ];
+        for (width, height) in [(20, 8), (80, 24), (160, 50)] {
+            for panel in PANEL_ORDER {
+                for detail in [DetailTab::Logs, DetailTab::Stats, DetailTab::Info] {
+                    for mode in modes.clone() {
+                        let mut app = rendered_app();
+                        app.panel = panel;
+                        app.detail = detail;
+                        app.mode = mode;
+                        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                        assert_eq!(terminal.backend().buffer().area.width, width);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn log_render_cache_appends_and_rebuilds_only_when_geometry_changes() {
+        let mut app = rendered_app();
+        app.logs_id = Some("c".into());
+        app.apply(crate::app::AppEvent::Log("c".into(), "one\ntwo".into()));
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal.draw(|f| draw_logs(f, &mut app, f.area())).unwrap();
+        let original: Vec<_> = app
+            .log_render_cache
+            .rows
+            .iter()
+            .map(|row| row.seq)
+            .collect();
+        assert_eq!(original, vec![0, 1]);
+
+        app.apply(crate::app::AppEvent::Log("c".into(), "three".into()));
+        terminal.draw(|f| draw_logs(f, &mut app, f.area())).unwrap();
+        assert_eq!(
+            app.log_render_cache
+                .rows
+                .iter()
+                .map(|row| row.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let old_width = app.log_render_cache.width;
+
+        let mut narrow = Terminal::new(TestBackend::new(12, 8)).unwrap();
+        narrow.draw(|f| draw_logs(f, &mut app, f.area())).unwrap();
+        assert_ne!(app.log_render_cache.width, old_width);
+        assert_eq!(app.log_render_cache.last_seq, Some(2));
     }
 }

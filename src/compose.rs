@@ -6,10 +6,10 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
-use crate::app::{AppEvent, ComposeRow};
+use crate::app::{AppEvent, AppSender, ComposeRow};
+use crate::operations;
 
 /// Log-buffer key for a compose project (kept distinct from container ids).
 pub fn log_key(project: &str) -> String {
@@ -17,7 +17,7 @@ pub fn log_key(project: &str) -> String {
 }
 
 /// Detect the compose plugin once at startup.
-pub fn spawn_probe(tx: Sender<AppEvent>) {
+pub fn spawn_probe(tx: AppSender) {
     thread::spawn(move || {
         let ok = Command::new("docker")
             .args(["compose", "version"])
@@ -60,14 +60,17 @@ impl ComposeAction {
 
 /// Run `docker compose <action>` for a project, streaming output into the
 /// project's log buffer and toasting the final status.
-pub fn compose_action(tx: &Sender<AppEvent>, action: ComposeAction, p: ComposeRow) {
+pub fn compose_action(tx: &AppSender, action: ComposeAction, p: ComposeRow) {
     let tx = tx.clone();
     thread::spawn(move || {
+        let operation = operations::begin(action.verb(), "compose", &p.name, "");
         let verb = action.verb();
         let mut cmd = Command::new("docker");
         cmd.arg("compose").arg("-p").arg(&p.name);
         if action.needs_files() {
             if p.config_files.is_empty() {
+                let result: Result<(), &str> = Err("compose file unknown");
+                operation.finish(&result);
                 let _ = tx.send(AppEvent::Toast(
                     format!("{}: compose file unknown, cannot {verb}", p.name),
                     true,
@@ -90,13 +93,20 @@ pub fn compose_action(tx: &Sender<AppEvent>, action: ComposeAction, p: ComposeRo
                 cmd.arg(verb);
             }
         }
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let key = log_key(&p.name);
-        let _ = tx.send(AppEvent::Log(key.clone(), format!("compose ▸ {verb} {}…", p.name)));
+        let _ = tx.send(AppEvent::Log(
+            key.clone(),
+            format!("compose ▸ {verb} {}…", p.name),
+        ));
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                let result: Result<(), String> = Err(e.to_string());
+                operation.finish(&result);
                 let _ = tx.send(AppEvent::Toast(format!("docker compose: {e}"), true));
                 return;
             }
@@ -114,20 +124,26 @@ pub fn compose_action(tx: &Sender<AppEvent>, action: ComposeAction, p: ComposeRo
             let _ = pump.join();
         }
 
-        let _ = match status {
-            Ok(s) if s.success() => {
-                tx.send(AppEvent::Toast(format!("compose {verb} {} done", p.name), false))
-            }
-            Ok(s) => tx.send(AppEvent::Toast(
-                format!("compose {verb} {} failed ({s})", p.name),
+        let result: Result<(), String> = match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(s.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        operation.finish(&result);
+        let _ = match result {
+            Ok(()) => tx.send(AppEvent::Toast(
+                format!("compose {verb} {} done", p.name),
+                false,
+            )),
+            Err(error) => tx.send(AppEvent::Toast(
+                format!("compose {verb} {} failed ({error})", p.name),
                 true,
             )),
-            Err(e) => tx.send(AppEvent::Toast(format!("compose {verb}: {e}"), true)),
         };
     });
 }
 
-fn stream_lines<R>(reader: R, tx: Sender<AppEvent>, key: String) -> JoinHandle<()>
+fn stream_lines<R>(reader: R, tx: AppSender, key: String) -> JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
@@ -137,7 +153,10 @@ where
             if line.trim().is_empty() {
                 continue;
             }
-            if tx.send(AppEvent::Log(key.clone(), format!("compose ▸ {line}"))).is_err() {
+            if tx
+                .send(AppEvent::Log(key.clone(), format!("compose ▸ {line}")))
+                .is_err()
+            {
                 return;
             }
         }
@@ -174,7 +193,7 @@ mod tests {
 
     #[test]
     fn up_without_config_files_toasts_error() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
         let p = ComposeRow {
             name: "p".into(),
             config_files: String::new(),
@@ -195,7 +214,7 @@ mod tests {
 
     #[test]
     fn stream_lines_prefixes_and_skips_blank() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
         let input: &[u8] = b"first\n\n  \nsecond\n";
         stream_lines(input, tx, "k".into()).join().unwrap();
         let mut got = Vec::new();

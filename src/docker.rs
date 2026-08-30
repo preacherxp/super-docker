@@ -7,17 +7,18 @@ use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::{
-    human_bytes, AppEvent, ContainerRow, EventRow, ImageRow, NetworkRow, RowState, StatSample,
-    VolumeRow,
+    AppEvent, AppSender, ContainerRow, EventRow, ImageRow, NetworkRow, RowState, StatSample,
+    VolumeRow, human_bytes,
 };
 use crate::http::{self, Transport};
 use crate::json::{self, Value};
+use crate::operations;
 
 // ---------------------------------------------------------------- errors
 
@@ -51,7 +52,9 @@ pub fn connect() -> Result<Docker, Error> {
     if let Ok(host) = std::env::var("DOCKER_HOST") {
         if !host.is_empty() {
             if let Some(p) = host.strip_prefix("unix://") {
-                return Ok(Docker { transport: Transport::Unix(PathBuf::from(p)) });
+                return Ok(Docker {
+                    transport: Transport::Unix(PathBuf::from(p)),
+                });
             }
             if let Some(a) = host.strip_prefix("tcp://") {
                 return Ok(Docker {
@@ -74,17 +77,23 @@ pub fn connect() -> Result<Docker, Error> {
     }
     for p in candidates {
         if p.exists() {
-            return Ok(Docker { transport: Transport::Unix(p) });
+            return Ok(Docker {
+                transport: Transport::Unix(p),
+            });
         }
     }
-    Err(Error("no docker socket found (is the daemon running? try DOCKER_HOST)".into()))
+    Err(Error(
+        "no docker socket found (is the daemon running? try DOCKER_HOST)".into(),
+    ))
 }
 
 impl Docker {
-    /// Client that never touches a socket — for tests.
-    #[cfg(test)]
+    /// Client that never touches a socket — for tests and benchmarks.
+    #[doc(hidden)]
     pub fn dummy() -> Docker {
-        Docker { transport: Transport::Unix(PathBuf::from("/nonexistent/docker.sock")) }
+        Docker {
+            transport: Transport::Unix(PathBuf::from("/nonexistent/docker.sock")),
+        }
     }
 
     /// One API call; 4xx/5xx becomes `Err` with the daemon's message.
@@ -112,6 +121,15 @@ impl Docker {
         json::parse(String::from_utf8_lossy(&body).trim()).map_err(Error)
     }
 
+    fn get_json_cancellable(&self, path: &str, handle: &TaskHandle) -> Result<Value, Error> {
+        let mut resp = self.call("GET", path)?;
+        if !handle.register(&resp) {
+            return Err(Error("request cancelled".into()));
+        }
+        let body = resp.read_all()?;
+        json::parse(String::from_utf8_lossy(&body).trim()).map_err(Error)
+    }
+
     /// POST/DELETE where only success matters; response body is drained.
     fn simple(&self, method: &str, path: &str) -> Result<(), Error> {
         let mut resp = self.call(method, path)?;
@@ -131,7 +149,10 @@ impl Docker {
     }
 
     fn version(&self) -> Result<String, Error> {
-        Ok(self.get_json("/version")?.str_of("Version").unwrap_or_default())
+        Ok(self
+            .get_json("/version")?
+            .str_of("Version")
+            .unwrap_or_default())
     }
 }
 
@@ -167,13 +188,59 @@ impl TaskHandle {
 
 type StatTasks = Arc<Mutex<HashMap<String, TaskHandle>>>;
 
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(75);
+const DISCONNECTED_CONTAINER_POLL_TICKS: u64 = 1;
+const HEALTHY_CONTAINER_POLL_TICKS: u64 = 15;
+const RESOURCE_POLL_TICKS: u64 = 30;
+const VOLUME_SIZE_POLL_TICKS: u64 = 150;
+
+#[derive(Debug, Clone, Copy)]
+enum RefreshKind {
+    Containers,
+    Images,
+    Volumes,
+    Networks,
+    VolumeSizes,
+}
+
+#[derive(Default)]
+struct RefreshSet {
+    containers: bool,
+    images: bool,
+    volumes: bool,
+    networks: bool,
+    volume_sizes: bool,
+}
+
+impl RefreshSet {
+    fn insert(&mut self, kind: RefreshKind) {
+        match kind {
+            RefreshKind::Containers => self.containers = true,
+            RefreshKind::Images => self.images = true,
+            RefreshKind::Volumes => self.volumes = true,
+            RefreshKind::Networks => self.networks = true,
+            RefreshKind::VolumeSizes => self.volume_sizes = true,
+        }
+    }
+}
+
+fn request_refresh(tx: &SyncSender<RefreshKind>, kind: RefreshKind) -> bool {
+    match tx.try_send(kind) {
+        Ok(()) | Err(TrySendError::Full(_)) => true,
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
 // ---------------------------------------------------------------- worker
 
-pub fn spawn_worker(docker: Docker, tx: Sender<AppEvent>) {
+pub fn spawn_worker(docker: Docker, tx: AppSender) {
     let stat_tasks: StatTasks = Default::default();
+    let events_healthy = Arc::new(AtomicBool::new(false));
+    let (refresh_tx, refresh_rx) = mpsc::sync_channel::<RefreshKind>(64);
 
-    // Fallback polling: containers every 2s (uptime text), the rest every
-    // ~14s. Docker events drive immediate refreshes in between.
+    // One scheduler owns list requests. Event storms and poll ticks only set
+    // resource bits, so a compose burst cannot trigger hundreds of identical
+    // full-list requests.
     {
         let docker = docker.clone();
         let tx = tx.clone();
@@ -187,56 +254,134 @@ pub fn spawn_worker(docker: Docker, tx: Sender<AppEvent>) {
             refresh_volumes(&docker, &tx);
             refresh_networks(&docker, &tx);
             refresh_volume_sizes(&docker, &tx);
-            let mut ticks = 0u64;
             loop {
-                thread::sleep(Duration::from_secs(2));
-                if !refresh_containers(&docker, &tx, &stat_tasks) {
+                let first = match refresh_rx.recv() {
+                    Ok(kind) => kind,
+                    Err(_) => return,
+                };
+                let mut pending = RefreshSet::default();
+                pending.insert(first);
+                let deadline = Instant::now() + REFRESH_DEBOUNCE;
+                loop {
+                    match refresh_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(kind) => pending.insert(kind),
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                if pending.containers && !refresh_containers(&docker, &tx, &stat_tasks) {
                     // UI is gone — stop the stat streams and exit
                     for (_, h) in stat_tasks.lock().unwrap().drain() {
                         h.abort();
                     }
                     return;
                 }
-                ticks += 1;
-                if ticks % 7 == 0 {
+                if pending.images {
                     refresh_images(&docker, &tx);
+                }
+                if pending.volumes {
                     refresh_volumes(&docker, &tx);
+                }
+                if pending.networks {
                     refresh_networks(&docker, &tx);
+                }
+                if pending.volume_sizes {
                     refresh_volume_sizes(&docker, &tx);
                 }
             }
         });
     }
 
-    thread::spawn(move || loop {
-        if let Ok(mut resp) = docker.stream("/events") {
-            while let Ok(Some(line)) = resp.read_line() {
-                let Ok(msg) = json::parse(&line) else { continue };
-                // `docker exec` produces several exec_* events but does not
-                // change any list data. Ignore the whole event here so one
-                // shell launch does not trigger a burst of identical API
-                // refreshes.
-                let Some(row) = event_row(&msg) else { continue };
-                if tx.send(AppEvent::Event(row)).is_err() {
+    // Polling is a fast fallback only while the event stream is down. A slow
+    // reconciliation remains while healthy in case the daemon drops an event.
+    {
+        let refresh_tx = refresh_tx.clone();
+        let events_healthy = events_healthy.clone();
+        thread::spawn(move || {
+            let mut ticks = 0u64;
+            loop {
+                thread::sleep(Duration::from_secs(2));
+                ticks = ticks.wrapping_add(1);
+                let container_ticks = if events_healthy.load(Ordering::SeqCst) {
+                    HEALTHY_CONTAINER_POLL_TICKS
+                } else {
+                    DISCONNECTED_CONTAINER_POLL_TICKS
+                };
+                if ticks % container_ticks == 0
+                    && !request_refresh(&refresh_tx, RefreshKind::Containers)
+                {
                     return;
                 }
-                match msg.get("Type").and_then(Value::as_str) {
-                    Some("container") => {
-                        refresh_containers(&docker, &tx, &stat_tasks);
+                if ticks % RESOURCE_POLL_TICKS == 0 {
+                    for kind in [
+                        RefreshKind::Images,
+                        RefreshKind::Volumes,
+                        RefreshKind::Networks,
+                    ] {
+                        if !request_refresh(&refresh_tx, kind) {
+                            return;
+                        }
                     }
-                    Some("image") => {
-                        refresh_images(&docker, &tx);
-                        refresh_containers(&docker, &tx, &stat_tasks);
-                    }
-                    Some("volume") => refresh_volumes(&docker, &tx),
-                    Some("network") => refresh_networks(&docker, &tx),
-                    _ => {}
+                }
+                if ticks % VOLUME_SIZE_POLL_TICKS == 0
+                    && !request_refresh(&refresh_tx, RefreshKind::VolumeSizes)
+                {
+                    return;
                 }
             }
-        }
-        thread::sleep(Duration::from_secs(2));
-        if !refresh_containers(&docker, &tx, &stat_tasks) {
-            return;
+        });
+    }
+
+    thread::spawn(move || {
+        loop {
+            if let Ok(mut resp) = docker.stream("/events") {
+                events_healthy.store(true, Ordering::SeqCst);
+                while let Ok(Some(line)) = resp.read_line() {
+                    let Ok(msg) = json::parse(&line) else {
+                        continue;
+                    };
+                    // `docker exec` produces several exec_* events but does not
+                    // change any list data. Ignore the whole event here so one
+                    // shell launch does not trigger a burst of identical API
+                    // refreshes.
+                    let Some(row) = event_row(&msg) else { continue };
+                    if tx.send(AppEvent::Event(row)).is_err() {
+                        return;
+                    }
+                    match msg.get("Type").and_then(Value::as_str) {
+                        Some("container") => {
+                            if !request_refresh(&refresh_tx, RefreshKind::Containers) {
+                                return;
+                            }
+                        }
+                        Some("image") => {
+                            if !request_refresh(&refresh_tx, RefreshKind::Images)
+                                || !request_refresh(&refresh_tx, RefreshKind::Containers)
+                            {
+                                return;
+                            }
+                        }
+                        Some("volume") => {
+                            if !request_refresh(&refresh_tx, RefreshKind::Volumes) {
+                                return;
+                            }
+                        }
+                        Some("network") => {
+                            if !request_refresh(&refresh_tx, RefreshKind::Networks) {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            events_healthy.store(false, Ordering::SeqCst);
+            thread::sleep(Duration::from_secs(2));
+            if !request_refresh(&refresh_tx, RefreshKind::Containers) {
+                return;
+            }
         }
     });
 }
@@ -297,13 +442,18 @@ pub struct ContainerSummary {
 
 fn summary_from_value(c: &Value) -> ContainerSummary {
     let names = c.get("Names").and_then(Value::as_array).map(|a| {
-        a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
     });
     let ports = c.get("Ports").and_then(Value::as_array).map(|a| {
         a.iter()
             .map(|p| PortSummary {
                 private_port: p.get("PrivatePort").and_then(Value::as_u64).unwrap_or(0) as u16,
-                public_port: p.get("PublicPort").and_then(Value::as_u64).map(|v| v as u16),
+                public_port: p
+                    .get("PublicPort")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u16),
                 typ: p.str_of("Type"),
             })
             .collect()
@@ -401,7 +551,7 @@ fn row_from_summary(c: ContainerSummary) -> ContainerRow {
 }
 
 /// Returns false once the UI side of the channel is gone.
-fn refresh_containers(docker: &Docker, tx: &Sender<AppEvent>, stat_tasks: &StatTasks) -> bool {
+fn refresh_containers(docker: &Docker, tx: &AppSender, stat_tasks: &StatTasks) -> bool {
     match docker.get_json("/containers/json?all=true") {
         Ok(list) => {
             // ordering is applied in App::filtered_* per the active sort
@@ -443,7 +593,7 @@ fn refresh_containers(docker: &Docker, tx: &Sender<AppEvent>, stat_tasks: &StatT
     }
 }
 
-fn refresh_images(docker: &Docker, tx: &Sender<AppEvent>) {
+fn refresh_images(docker: &Docker, tx: &AppSender) {
     if let Ok(list) = docker.get_json("/images/json") {
         let rows: Vec<ImageRow> = list
             .as_array()
@@ -467,7 +617,7 @@ fn refresh_images(docker: &Docker, tx: &Sender<AppEvent>) {
     }
 }
 
-fn refresh_volumes(docker: &Docker, tx: &Sender<AppEvent>) {
+fn refresh_volumes(docker: &Docker, tx: &AppSender) {
     if let Ok(resp) = docker.get_json("/volumes") {
         let rows: Vec<VolumeRow> = resp
             .get("Volumes")
@@ -485,7 +635,7 @@ fn refresh_volumes(docker: &Docker, tx: &Sender<AppEvent>) {
     }
 }
 
-fn refresh_networks(docker: &Docker, tx: &Sender<AppEvent>) {
+fn refresh_networks(docker: &Docker, tx: &AppSender) {
     if let Ok(list) = docker.get_json("/networks") {
         let rows: Vec<NetworkRow> = list
             .as_array()
@@ -511,7 +661,7 @@ fn refresh_networks(docker: &Docker, tx: &Sender<AppEvent>) {
 
 /// Volume sizes come from the `/system/df` endpoint — the volume list does
 /// not report them. Refreshed on the slow cadence only; df walks the disk.
-fn refresh_volume_sizes(docker: &Docker, tx: &Sender<AppEvent>) {
+fn refresh_volume_sizes(docker: &Docker, tx: &AppSender) {
     if let Ok(df) = docker.get_json("/system/df") {
         let sizes: HashMap<String, i64> = df
             .get("Volumes")
@@ -573,18 +723,17 @@ fn stats_from_value(v: &Value) -> StatsResponse {
         cache: m
             .get("stats")
             .and_then(Value::as_object)
-            .and_then(|s| s.get("inactive_file").or_else(|| s.get("total_inactive_file")))
+            .and_then(|s| {
+                s.get("inactive_file")
+                    .or_else(|| s.get("total_inactive_file"))
+            })
             .and_then(Value::as_u64),
     });
     let networks = v.get("networks").and_then(Value::as_object).map(|m| {
         m.values().fold((0u64, 0u64), |(rx, tx), n| {
             (
-                rx.saturating_add(
-                    n.get("rx_bytes").and_then(Value::as_u64).unwrap_or(0),
-                ),
-                tx.saturating_add(
-                    n.get("tx_bytes").and_then(Value::as_u64).unwrap_or(0),
-                ),
+                rx.saturating_add(n.get("rx_bytes").and_then(Value::as_u64).unwrap_or(0)),
+                tx.saturating_add(n.get("tx_bytes").and_then(Value::as_u64).unwrap_or(0)),
             )
         })
     });
@@ -600,12 +749,14 @@ fn stats_from_value(v: &Value) -> StatsResponse {
     }
 }
 
-fn spawn_stats(docker: Docker, tx: Sender<AppEvent>, id: String) -> TaskHandle {
+fn spawn_stats(docker: Docker, tx: AppSender, id: String) -> TaskHandle {
     let handle = TaskHandle::default();
     let h = handle.clone();
     thread::spawn(move || {
         let path = format!("/containers/{id}/stats?stream=true");
-        let Ok(mut resp) = docker.stream(&path) else { return };
+        let Ok(mut resp) = docker.stream(&path) else {
+            return;
+        };
         if !h.register(&resp) {
             return;
         }
@@ -636,10 +787,12 @@ fn network_rates(previous: (u64, u64), current: (u64, u64), elapsed: Duration) -
     if seconds <= f64::EPSILON {
         return (0, 0);
     }
-    let per_second = |before: u64, now: u64| {
-        (now.saturating_sub(before) as f64 / seconds).round() as u64
-    };
-    (per_second(previous.0, current.0), per_second(previous.1, current.1))
+    let per_second =
+        |before: u64, now: u64| (now.saturating_sub(before) as f64 / seconds).round() as u64;
+    (
+        per_second(previous.0, current.0),
+        per_second(previous.1, current.1),
+    )
 }
 
 fn compute_sample(id: &str, st: &StatsResponse) -> Option<StatSample> {
@@ -743,7 +896,7 @@ fn is_multiplexed(content_type: &str, first: &[u8; 8]) -> bool {
 /// optionally prefixed per line with a compose service name.
 fn log_stream(
     docker: Docker,
-    tx: Sender<AppEvent>,
+    tx: AppSender,
     handle: TaskHandle,
     key: String,
     id: String,
@@ -751,14 +904,18 @@ fn log_stream(
     service: Option<String>,
 ) {
     let path = format!("/containers/{id}/logs?follow=true&stdout=true&stderr=true&tail={tail}");
-    let Ok(mut resp) = docker.stream(&path) else { return };
+    let Ok(mut resp) = docker.stream(&path) else {
+        return;
+    };
     if !handle.register(&resp) {
         return;
     }
 
     // First 8 bytes decide the framing (and are part of the data when raw).
     let mut first = [0u8; 8];
-    let Some(()) = read_exact(&mut resp, &mut first) else { return };
+    let Some(()) = read_exact(&mut resp, &mut first) else {
+        return;
+    };
     let multiplexed = is_multiplexed(&resp.content_type, &first);
 
     let mut pending: Option<Vec<u8>> = if multiplexed {
@@ -800,7 +957,7 @@ fn log_stream(
     }
 }
 
-pub fn spawn_logs(docker: &Docker, tx: &Sender<AppEvent>, id: String) -> TaskHandle {
+pub fn spawn_logs(docker: &Docker, tx: &AppSender, id: String) -> TaskHandle {
     let handle = TaskHandle::default();
     let (docker, tx, h) = (docker.clone(), tx.clone(), handle.clone());
     thread::spawn(move || log_stream(docker, tx, h, id.clone(), id, "500", None));
@@ -811,7 +968,7 @@ pub fn spawn_logs(docker: &Docker, tx: &Sender<AppEvent>, id: String) -> TaskHan
 /// with its service name, all funneled into one log buffer under `key`.
 pub fn spawn_compose_logs(
     docker: &Docker,
-    tx: &Sender<AppEvent>,
+    tx: &AppSender,
     key: String,
     members: Vec<(String, String)>,
 ) -> Vec<TaskHandle> {
@@ -828,11 +985,14 @@ pub fn spawn_compose_logs(
 
 // --------------------------------------------------------------- inspect
 
-pub fn spawn_inspect(docker: &Docker, tx: &Sender<AppEvent>, id: String) {
+pub fn spawn_inspect(docker: &Docker, tx: &AppSender, id: String) -> TaskHandle {
+    let handle = TaskHandle::default();
+    let task_handle = handle.clone();
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let Ok(d) = docker.get_json(&format!("/containers/{id}/json")) else {
+        let Ok(d) = docker.get_json_cancellable(&format!("/containers/{id}/json"), &task_handle)
+        else {
             return;
         };
         let mut kv: Vec<(String, String)> = Vec::new();
@@ -843,7 +1003,9 @@ pub fn spawn_inspect(docker: &Docker, tx: &Sender<AppEvent>, id: String) {
         };
         push(
             "ID",
-            d.str_of("Id").map(|i| i[..12.min(i.len())].to_string()).unwrap_or_default(),
+            d.str_of("Id")
+                .map(|i| i[..12.min(i.len())].to_string())
+                .unwrap_or_default(),
         );
         if let Some(cfg) = d.get("Config") {
             push("Image", cfg.str_of("Image").unwrap_or_default());
@@ -869,10 +1031,12 @@ pub fn spawn_inspect(docker: &Docker, tx: &Sender<AppEvent>, id: String) {
                 // last few probe results, newest first — first line only
                 let log = h.get("Log").and_then(Value::as_array).unwrap_or(&[]);
                 for r in log.iter().rev().take(3) {
-                    let code = r.get("ExitCode").and_then(Value::as_i64).unwrap_or_default();
+                    let code = r
+                        .get("ExitCode")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
                     let out = r.str_of("Output").unwrap_or_default();
-                    let line: String =
-                        out.lines().next().unwrap_or("").chars().take(120).collect();
+                    let line: String = out.lines().next().unwrap_or("").chars().take(120).collect();
                     push("Probe", format!("[{code}] {line}").trim_end().to_string());
                 }
             }
@@ -891,7 +1055,10 @@ pub fn spawn_inspect(docker: &Docker, tx: &Sender<AppEvent>, id: String) {
         push("Command", cmd.trim().to_string());
         push(
             "Restarts",
-            d.get("RestartCount").and_then(Value::as_i64).unwrap_or(0).to_string(),
+            d.get("RestartCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .to_string(),
         );
         if let Some(rp) = d.get("HostConfig").and_then(|hc| hc.get("RestartPolicy")) {
             push("Restart policy", rp.str_of("Name").unwrap_or_default());
@@ -925,6 +1092,7 @@ pub fn spawn_inspect(docker: &Docker, tx: &Sender<AppEvent>, id: String) {
         }
         let _ = tx.send(AppEvent::Inspect(id, kv));
     });
+    handle
 }
 
 // --------------------------------------------------------------- actions
@@ -937,6 +1105,19 @@ pub enum CtrAction {
     Pause,
     Unpause,
     Remove,
+}
+
+impl CtrAction {
+    fn verb(self) -> &'static str {
+        match self {
+            CtrAction::Start => "start",
+            CtrAction::Stop => "stop",
+            CtrAction::Restart => "restart",
+            CtrAction::Pause => "pause",
+            CtrAction::Unpause => "unpause",
+            CtrAction::Remove => "remove",
+        }
+    }
 }
 
 fn run_ctr_action(docker: &Docker, action: CtrAction, id: &str) -> Result<(), Error> {
@@ -952,7 +1133,7 @@ fn run_ctr_action(docker: &Docker, action: CtrAction, id: &str) -> Result<(), Er
 
 pub fn container_action(
     docker: &Docker,
-    tx: &Sender<AppEvent>,
+    tx: &AppSender,
     action: CtrAction,
     id: String,
     name: String,
@@ -960,6 +1141,7 @@ pub fn container_action(
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
+        let operation = operations::begin(action.verb(), "container", &name, &id);
         let verb = match action {
             CtrAction::Start => "started",
             CtrAction::Stop => "stopped",
@@ -968,7 +1150,9 @@ pub fn container_action(
             CtrAction::Unpause => "unpaused",
             CtrAction::Remove => "removed",
         };
-        let _ = match run_ctr_action(&docker, action, &id) {
+        let result = run_ctr_action(&docker, action, &id);
+        operation.finish(&result);
+        let _ = match result {
             Ok(()) => tx.send(AppEvent::Toast(format!("{verb} {name}"), false)),
             Err(e) => tx.send(AppEvent::Toast(format!("{name}: {e}"), true)),
         };
@@ -978,55 +1162,68 @@ pub fn container_action(
 /// Kill a container with an explicit signal (`K` picker: TERM / KILL / HUP).
 pub fn kill_container(
     docker: &Docker,
-    tx: &Sender<AppEvent>,
+    tx: &AppSender,
     id: String,
     name: String,
     signal: &'static str,
 ) {
+    let action = format!("kill {signal}");
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.simple("POST", &format!("/containers/{id}/kill?signal={signal}")) {
+        let operation = operations::begin(&action, "container", &name, &id);
+        let result = docker.simple("POST", &format!("/containers/{id}/kill?signal={signal}"));
+        operation.finish(&result);
+        let _ = match result {
             Ok(()) => tx.send(AppEvent::Toast(format!("sent {signal} to {name}"), false)),
             Err(e) => tx.send(AppEvent::Toast(format!("{name}: {e}"), true)),
         };
     });
 }
 
-pub fn remove_image(docker: &Docker, tx: &Sender<AppEvent>, id: String, tag: String) {
+pub fn remove_image(docker: &Docker, tx: &AppSender, id: String, tag: String) {
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.simple("DELETE", &format!("/images/{id}?force=true")) {
+        let operation = operations::begin("remove", "image", &tag, &id);
+        let result = docker.simple("DELETE", &format!("/images/{id}?force=true"));
+        operation.finish(&result);
+        let _ = match result {
             Ok(()) => tx.send(AppEvent::Toast(format!("removed {tag}"), false)),
             Err(e) => tx.send(AppEvent::Toast(format!("{tag}: {e}"), true)),
         };
     });
 }
 
-pub fn remove_volume(docker: &Docker, tx: &Sender<AppEvent>, name: String) {
+pub fn remove_volume(docker: &Docker, tx: &AppSender, name: String) {
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.simple("DELETE", &format!("/volumes/{name}")) {
+        let operation = operations::begin("remove", "volume", &name, "");
+        let result = docker.simple("DELETE", &format!("/volumes/{name}"));
+        operation.finish(&result);
+        let _ = match result {
             Ok(()) => tx.send(AppEvent::Toast(format!("removed {name}"), false)),
             Err(e) => tx.send(AppEvent::Toast(format!("{name}: {e}"), true)),
         };
     });
 }
 
-pub fn remove_network(docker: &Docker, tx: &Sender<AppEvent>, id: String, name: String) {
+pub fn remove_network(docker: &Docker, tx: &AppSender, id: String, name: String) {
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.simple("DELETE", &format!("/networks/{id}")) {
+        let operation = operations::begin("remove", "network", &name, &id);
+        let result = docker.simple("DELETE", &format!("/networks/{id}"));
+        operation.finish(&result);
+        let _ = match result {
             Ok(()) => tx.send(AppEvent::Toast(format!("removed {name}"), false)),
             Err(e) => tx.send(AppEvent::Toast(format!("{name}: {e}"), true)),
         };
     });
 }
 
-fn batch_toast(tx: &Sender<AppEvent>, what: &str, total: usize, failed: usize, last_err: String) {
+fn batch_toast(tx: &AppSender, what: &str, total: usize, failed: usize, last_err: String) {
     let _ = if failed == 0 {
         tx.send(AppEvent::Toast(format!("removed {total} {what}"), false))
     } else {
@@ -1037,14 +1234,16 @@ fn batch_toast(tx: &Sender<AppEvent>, what: &str, total: usize, failed: usize, l
     };
 }
 
-pub fn remove_containers_batch(
-    docker: &Docker,
-    tx: &Sender<AppEvent>,
-    items: Vec<(String, String)>,
-) {
+pub fn remove_containers_batch(docker: &Docker, tx: &AppSender, items: Vec<(String, String)>) {
+    let target = items
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
+        let operation = operations::begin("remove batch", "container", &target, "");
         let total = items.len();
         let mut failed = 0;
         let mut last_err = String::new();
@@ -1054,18 +1253,26 @@ pub fn remove_containers_batch(
                 last_err = format!("{name}: {e}");
             }
         }
+        let result: Result<(), String> = if failed == 0 {
+            Ok(())
+        } else {
+            Err(last_err.clone())
+        };
+        operation.finish(&result);
         batch_toast(&tx, "containers", total, failed, last_err);
     });
 }
 
-pub fn remove_images_batch(
-    docker: &Docker,
-    tx: &Sender<AppEvent>,
-    items: Vec<(String, String)>,
-) {
+pub fn remove_images_batch(docker: &Docker, tx: &AppSender, items: Vec<(String, String)>) {
+    let target = items
+        .iter()
+        .map(|(_, tag)| tag.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
+        let operation = operations::begin("remove batch", "image", &target, "");
         let total = items.len();
         let mut failed = 0;
         let mut last_err = String::new();
@@ -1075,14 +1282,22 @@ pub fn remove_images_batch(
                 last_err = format!("{tag}: {e}");
             }
         }
+        let result: Result<(), String> = if failed == 0 {
+            Ok(())
+        } else {
+            Err(last_err.clone())
+        };
+        operation.finish(&result);
         batch_toast(&tx, "images", total, failed, last_err);
     });
 }
 
-pub fn remove_volumes_batch(docker: &Docker, tx: &Sender<AppEvent>, items: Vec<String>) {
+pub fn remove_volumes_batch(docker: &Docker, tx: &AppSender, items: Vec<String>) {
+    let target = items.join(", ");
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
+        let operation = operations::begin("remove batch", "volume", &target, "");
         let total = items.len();
         let mut failed = 0;
         let mut last_err = String::new();
@@ -1092,18 +1307,26 @@ pub fn remove_volumes_batch(docker: &Docker, tx: &Sender<AppEvent>, items: Vec<S
                 last_err = format!("{name}: {e}");
             }
         }
+        let result: Result<(), String> = if failed == 0 {
+            Ok(())
+        } else {
+            Err(last_err.clone())
+        };
+        operation.finish(&result);
         batch_toast(&tx, "volumes", total, failed, last_err);
     });
 }
 
-pub fn remove_networks_batch(
-    docker: &Docker,
-    tx: &Sender<AppEvent>,
-    items: Vec<(String, String)>,
-) {
+pub fn remove_networks_batch(docker: &Docker, tx: &AppSender, items: Vec<(String, String)>) {
+    let target = items
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
+        let operation = operations::begin("remove batch", "network", &target, "");
         let total = items.len();
         let mut failed = 0;
         let mut last_err = String::new();
@@ -1113,15 +1336,24 @@ pub fn remove_networks_batch(
                 last_err = format!("{name}: {e}");
             }
         }
+        let result: Result<(), String> = if failed == 0 {
+            Ok(())
+        } else {
+            Err(last_err.clone())
+        };
+        operation.finish(&result);
         batch_toast(&tx, "networks", total, failed, last_err);
     });
 }
 
-pub fn prune_containers(docker: &Docker, tx: &Sender<AppEvent>) {
+pub fn prune_containers(docker: &Docker, tx: &AppSender) {
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.post_json("/containers/prune") {
+        let operation = operations::begin("prune", "container", "all stopped", "");
+        let result = docker.post_json("/containers/prune");
+        operation.finish(&result);
+        let _ = match result {
             Ok(r) => {
                 let n = r
                     .get("ContainersDeleted")
@@ -1135,32 +1367,50 @@ pub fn prune_containers(docker: &Docker, tx: &Sender<AppEvent>) {
     });
 }
 
-pub fn prune_images(docker: &Docker, tx: &Sender<AppEvent>) {
+pub fn prune_images(docker: &Docker, tx: &AppSender) {
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.post_json("/images/prune") {
+        let operation = operations::begin("prune", "image", "dangling", "");
+        let result = docker.post_json("/images/prune");
+        operation.finish(&result);
+        let _ = match result {
             Ok(r) => {
                 let freed = human_bytes(
-                    r.get("SpaceReclaimed").and_then(Value::as_i64).unwrap_or(0).max(0) as u64,
+                    r.get("SpaceReclaimed")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .max(0) as u64,
                 );
-                tx.send(AppEvent::Toast(format!("pruned images, freed {freed}"), false))
+                tx.send(AppEvent::Toast(
+                    format!("pruned images, freed {freed}"),
+                    false,
+                ))
             }
             Err(e) => tx.send(AppEvent::Toast(format!("prune: {e}"), true)),
         };
     });
 }
 
-pub fn prune_volumes(docker: &Docker, tx: &Sender<AppEvent>) {
+pub fn prune_volumes(docker: &Docker, tx: &AppSender) {
     let docker = docker.clone();
     let tx = tx.clone();
     thread::spawn(move || {
-        let _ = match docker.post_json("/volumes/prune") {
+        let operation = operations::begin("prune", "volume", "unused anonymous", "");
+        let result = docker.post_json("/volumes/prune");
+        operation.finish(&result);
+        let _ = match result {
             Ok(r) => {
                 let freed = human_bytes(
-                    r.get("SpaceReclaimed").and_then(Value::as_i64).unwrap_or(0).max(0) as u64,
+                    r.get("SpaceReclaimed")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .max(0) as u64,
                 );
-                tx.send(AppEvent::Toast(format!("pruned volumes, freed {freed}"), false))
+                tx.send(AppEvent::Toast(
+                    format!("pruned volumes, freed {freed}"),
+                    false,
+                ))
             }
             Err(e) => tx.send(AppEvent::Toast(format!("prune: {e}"), true)),
         };
@@ -1170,6 +1420,35 @@ pub fn prune_volumes(docker: &Docker, tx: &Sender<AppEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_set_coalesces_every_resource_kind() {
+        let mut set = RefreshSet::default();
+        for kind in [
+            RefreshKind::Containers,
+            RefreshKind::Images,
+            RefreshKind::Volumes,
+            RefreshKind::Networks,
+            RefreshKind::VolumeSizes,
+            RefreshKind::Containers,
+        ] {
+            set.insert(kind);
+        }
+        assert!(set.containers);
+        assert!(set.images);
+        assert!(set.volumes);
+        assert!(set.networks);
+        assert!(set.volume_sizes);
+    }
+
+    #[test]
+    fn refresh_request_treats_full_as_coalesced_and_disconnect_as_stop() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(request_refresh(&tx, RefreshKind::Images));
+        assert!(request_refresh(&tx, RefreshKind::Volumes));
+        drop(rx);
+        assert!(!request_refresh(&tx, RefreshKind::Networks));
+    }
 
     // ---- row_from_summary ----
 
@@ -1201,7 +1480,10 @@ mod tests {
             ("dead", RowState::Dead),
             ("bogus", RowState::Other),
         ] {
-            let c = ContainerSummary { state: Some(e.into()), ..Default::default() };
+            let c = ContainerSummary {
+                state: Some(e.into()),
+                ..Default::default()
+            };
             assert_eq!(row_from_summary(c).state, s);
         }
     }
@@ -1215,7 +1497,11 @@ mod tests {
         };
         let c = ContainerSummary {
             // duplicate mapping appears twice (e.g. ipv4 + ipv6) -> dedup
-            ports: Some(vec![port(80, Some(8080)), port(80, Some(8080)), port(5432, None)]),
+            ports: Some(vec![
+                port(80, Some(8080)),
+                port(80, Some(8080)),
+                port(5432, None),
+            ]),
             ..Default::default()
         };
         assert_eq!(row_from_summary(c).ports, "5432/tcp 8080→80/tcp");
@@ -1230,8 +1516,14 @@ mod tests {
             "com.docker.compose.project.config_files".to_string(),
             "/a/compose.yml".to_string(),
         );
-        labels.insert("com.docker.compose.project.working_dir".to_string(), "/a".to_string());
-        let c = ContainerSummary { labels: Some(labels), ..Default::default() };
+        labels.insert(
+            "com.docker.compose.project.working_dir".to_string(),
+            "/a".to_string(),
+        );
+        let c = ContainerSummary {
+            labels: Some(labels),
+            ..Default::default()
+        };
         let row = row_from_summary(c);
         assert_eq!(row.compose_project.as_deref(), Some("proj"));
         assert_eq!(row.compose_service.as_deref(), Some("web"));
@@ -1301,13 +1593,7 @@ mod tests {
 
     // ---- compute_sample ----
 
-    fn stats(
-        total: u64,
-        pre_total: u64,
-        sys: u64,
-        pre_sys: u64,
-        online: u64,
-    ) -> StatsResponse {
+    fn stats(total: u64, pre_total: u64, sys: u64, pre_sys: u64, online: u64) -> StatsResponse {
         StatsResponse {
             cpu_stats: Some(CpuStats {
                 total_usage: Some(total),
@@ -1444,7 +1730,10 @@ mod tests {
     #[test]
     fn multiplexed_detection() {
         let frame = [1u8, 0, 0, 0, 0, 0, 0, 5];
-        assert!(is_multiplexed("application/vnd.docker.multiplexed-stream", &[b'h'; 8]));
+        assert!(is_multiplexed(
+            "application/vnd.docker.multiplexed-stream",
+            &[b'h'; 8]
+        ));
         assert!(!is_multiplexed("application/vnd.docker.raw-stream", &frame));
         assert!(is_multiplexed("", &frame));
         assert!(!is_multiplexed("", b"hello wo"));
@@ -1454,7 +1743,7 @@ mod tests {
 
     #[test]
     fn batch_toast_success_and_partial_failure() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
         batch_toast(&tx, "images", 3, 0, String::new());
         match rx.try_recv().unwrap() {
             AppEvent::Toast(text, error) => {
