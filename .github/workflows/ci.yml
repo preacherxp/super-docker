@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - run: cargo build --release
+      - run: cargo bench --bench hot_paths
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Enforce line coverage baseline
+        run: cargo llvm-cov --lib --fail-under-lines 73
+
+  branch-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Enforce branch coverage baseline
+        shell: bash
+        run: |
+          cargo llvm-cov --lib --branch --lcov --output-path lcov.info
+          awk -F: '
+            /^BRF:/ { found += $2 }
+            /^BRH:/ { hit += $2 }
+            END {
+              percent = found ? 100 * hit / found : 0
+              printf "branch coverage: %.2f%% (%d/%d)\n", percent, hit, found
+              exit percent < 59
+            }
+          ' lcov.info

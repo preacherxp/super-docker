@@ -1,0 +1,39 @@
+name: Deep tests
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [json, log_ingest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} for 60 seconds
+        run: cargo fuzz --fuzz-dir fuzz run ${{ matrix.target }} -- -max_total_time=60
+
+  mutations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-mutants
+      - name: Verify high-value parser and state modules detect mutations
+        continue-on-error: true
+        run: cargo mutants --timeout 120 --in-place --file src/json.rs --file src/http.rs --file src/app.rs
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report
+          path: mutants.out
