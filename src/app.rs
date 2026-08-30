@@ -3,9 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::TableState;
 
@@ -180,10 +178,7 @@ pub struct EventRow {
 #[derive(Debug)]
 pub enum AppEvent {
     Version(String),
-    UpdateAvailable {
-        version: String,
-        tag: String,
-    },
+    UpdateAvailable { version: String, tag: String },
     Containers(Vec<ContainerRow>),
     Images(Vec<ImageRow>),
     Volumes(Vec<VolumeRow>),
@@ -196,9 +191,6 @@ pub enum AppEvent {
     ComposeAvailable(bool),
     VolumeSizes(HashMap<String, i64>),
     Event(EventRow),
-    /// Terminal input, pumped through the same channel as daemon events so
-    /// the main loop blocks in one place. Handled in `main`, not `apply`.
-    Input(Event),
 }
 
 /// Bounded producer used by every background task.  A bounded channel keeps a
@@ -622,71 +614,68 @@ impl App {
                 Panel::Networks => Self::matches_normalized(&self.networks[*index].name, &needle),
             })
             .collect();
-        indices.sort_by(|a, b| {
-            let ord = match panel {
-                Panel::Containers => {
-                    let (a, b) = (&self.containers[*a], &self.containers[*b]);
-                    let primary = match col {
-                        "name" => a.name.cmp(&b.name),
-                        "image" => a.image.cmp(&b.image),
-                        "created" => a.created.cmp(&b.created),
-                        "cpu" => self
-                            .last_stat(a, |sample| sample.cpu_pct)
-                            .total_cmp(&self.last_stat(b, |sample| sample.cpu_pct)),
-                        "mem" => self
-                            .last_stat(a, |sample| sample.mem_pct)
-                            .total_cmp(&self.last_stat(b, |sample| sample.mem_pct)),
-                        _ => state_rank(a.state).cmp(&state_rank(b.state)),
-                    };
-                    let primary = if desc { primary.reverse() } else { primary };
-                    primary.then_with(|| a.name.cmp(&b.name))
-                }
-                Panel::Compose => {
-                    let (a, b) = (&self.compose[*a], &self.compose[*b]);
-                    let primary = match col {
-                        "running" => a.running.cmp(&b.running),
-                        "total" => a.total.cmp(&b.total),
-                        _ => a.name.cmp(&b.name),
-                    };
-                    let primary = if desc { primary.reverse() } else { primary };
-                    primary.then_with(|| a.name.cmp(&b.name))
-                }
-                Panel::Images => {
-                    let (a, b) = (&self.images[*a], &self.images[*b]);
-                    let primary = match col {
-                        "size" => a.size.cmp(&b.size),
-                        "tag" => a.tag.cmp(&b.tag),
-                        "containers" => a.containers.cmp(&b.containers),
-                        _ => a.created.cmp(&b.created),
-                    };
-                    let primary = if desc { primary.reverse() } else { primary };
-                    primary.then_with(|| a.tag.cmp(&b.tag))
-                }
-                Panel::Volumes => {
-                    let (a, b) = (&self.volumes[*a], &self.volumes[*b]);
-                    let size =
-                        |row: &VolumeRow| self.volume_sizes.get(&row.name).copied().unwrap_or(-1);
-                    let primary = match col {
-                        "size" => size(a).cmp(&size(b)),
-                        "driver" => a.driver.cmp(&b.driver),
-                        "created" => a.created.cmp(&b.created),
-                        _ => a.name.cmp(&b.name),
-                    };
-                    let primary = if desc { primary.reverse() } else { primary };
-                    primary.then_with(|| a.name.cmp(&b.name))
-                }
-                Panel::Networks => {
-                    let (a, b) = (&self.networks[*a], &self.networks[*b]);
-                    let primary = match col {
-                        "driver" => a.driver.cmp(&b.driver),
-                        "scope" => a.scope.cmp(&b.scope),
-                        _ => a.name.cmp(&b.name),
-                    };
-                    let primary = if desc { primary.reverse() } else { primary };
-                    primary.then_with(|| a.name.cmp(&b.name))
-                }
-            };
-            ord
+        indices.sort_by(|a, b| match panel {
+            Panel::Containers => {
+                let (a, b) = (&self.containers[*a], &self.containers[*b]);
+                let primary = match col {
+                    "name" => a.name.cmp(&b.name),
+                    "image" => a.image.cmp(&b.image),
+                    "created" => a.created.cmp(&b.created),
+                    "cpu" => self
+                        .last_stat(a, |sample| sample.cpu_pct)
+                        .total_cmp(&self.last_stat(b, |sample| sample.cpu_pct)),
+                    "mem" => self
+                        .last_stat(a, |sample| sample.mem_pct)
+                        .total_cmp(&self.last_stat(b, |sample| sample.mem_pct)),
+                    _ => state_rank(a.state).cmp(&state_rank(b.state)),
+                };
+                let primary = if desc { primary.reverse() } else { primary };
+                primary.then_with(|| a.name.cmp(&b.name))
+            }
+            Panel::Compose => {
+                let (a, b) = (&self.compose[*a], &self.compose[*b]);
+                let primary = match col {
+                    "running" => a.running.cmp(&b.running),
+                    "total" => a.total.cmp(&b.total),
+                    _ => a.name.cmp(&b.name),
+                };
+                let primary = if desc { primary.reverse() } else { primary };
+                primary.then_with(|| a.name.cmp(&b.name))
+            }
+            Panel::Images => {
+                let (a, b) = (&self.images[*a], &self.images[*b]);
+                let primary = match col {
+                    "size" => a.size.cmp(&b.size),
+                    "tag" => a.tag.cmp(&b.tag),
+                    "containers" => a.containers.cmp(&b.containers),
+                    _ => a.created.cmp(&b.created),
+                };
+                let primary = if desc { primary.reverse() } else { primary };
+                primary.then_with(|| a.tag.cmp(&b.tag))
+            }
+            Panel::Volumes => {
+                let (a, b) = (&self.volumes[*a], &self.volumes[*b]);
+                let size =
+                    |row: &VolumeRow| self.volume_sizes.get(&row.name).copied().unwrap_or(-1);
+                let primary = match col {
+                    "size" => size(a).cmp(&size(b)),
+                    "driver" => a.driver.cmp(&b.driver),
+                    "created" => a.created.cmp(&b.created),
+                    _ => a.name.cmp(&b.name),
+                };
+                let primary = if desc { primary.reverse() } else { primary };
+                primary.then_with(|| a.name.cmp(&b.name))
+            }
+            Panel::Networks => {
+                let (a, b) = (&self.networks[*a], &self.networks[*b]);
+                let primary = match col {
+                    "driver" => a.driver.cmp(&b.driver),
+                    "scope" => a.scope.cmp(&b.scope),
+                    _ => a.name.cmp(&b.name),
+                };
+                let primary = if desc { primary.reverse() } else { primary };
+                primary.then_with(|| a.name.cmp(&b.name))
+            }
         });
 
         let mut cache = self.view_caches[panel_index].borrow_mut();
@@ -967,8 +956,6 @@ impl App {
                     self.events.pop_front();
                 }
             }
-            // input is routed in main, never applied here
-            AppEvent::Input(_) => {}
         }
     }
 
@@ -1335,12 +1322,12 @@ impl App {
         };
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                for i in 0..PANEL_ORDER.len() {
+                for (i, panel) in PANEL_ORDER.iter().enumerate() {
                     let r = self.layout.panels[i];
                     if !r.contains(pos) {
                         continue;
                     }
-                    self.panel = PANEL_ORDER[i];
+                    self.panel = *panel;
                     self.focus = Focus::Panels;
                     // rows start after top border (1) + table header (1)
                     let data_top = r.y + 2;
@@ -1353,10 +1340,12 @@ impl App {
                     self.schedule_selection_sync();
                     return;
                 }
-                if self.panel == Panel::Containers && self.layout.tabs_row.contains(pos) {
-                    if let Some(tab) = tab_at(pos.x - self.layout.tabs_row.x) {
-                        self.detail = tab;
-                    }
+                if let Some(tab) = (self.panel == Panel::Containers
+                    && self.layout.tabs_row.contains(pos))
+                .then(|| tab_at(pos.x - self.layout.tabs_row.x))
+                .flatten()
+                {
+                    self.detail = tab;
                 }
                 if self.layout.detail.contains(pos) {
                     self.focus = Focus::Detail;
@@ -1368,9 +1357,9 @@ impl App {
                 } else {
                     1
                 };
-                for i in 0..PANEL_ORDER.len() {
+                for (i, panel) in PANEL_ORDER.iter().enumerate() {
                     if self.layout.panels[i].contains(pos) {
-                        self.panel = PANEL_ORDER[i];
+                        self.panel = *panel;
                         self.move_sel(delta);
                         return;
                     }

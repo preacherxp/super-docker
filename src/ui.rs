@@ -129,16 +129,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
-    if let Some(t) = &app.toast {
-        if t.at.elapsed().as_secs() < 4 {
-            let color = if t.error { Color::Red } else { Color::Green };
-            let p = Paragraph::new(Line::from(Span::styled(
-                format!(" {} ", t.text),
-                Style::default().fg(Color::Black).bg(color),
-            )))
-            .alignment(Alignment::Right);
-            f.render_widget(p, area);
-        }
+    if let Some(t) = app
+        .toast
+        .as_ref()
+        .filter(|toast| toast.at.elapsed().as_secs() < 4)
+    {
+        let color = if t.error { Color::Red } else { Color::Green };
+        let p = Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", t.text),
+            Style::default().fg(Color::Black).bg(color),
+        )))
+        .alignment(Alignment::Right);
+        f.render_widget(p, area);
     }
 }
 
@@ -259,6 +261,7 @@ fn panel_window(app: &App, panel: Panel, area: Rect, content_len: usize) -> std:
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_table(
     f: &mut Frame,
     app: &mut App,
@@ -310,13 +313,11 @@ fn render_table(
 /// OOM kill, restart loop, failing healthcheck.
 fn container_badges(app: &App, c: &ContainerRow, now: i64) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if let Some(code) = exit_code_from_status(&c.status) {
-        if code != 0 {
-            spans.push(Span::styled(
-                format!(" ({code})"),
-                Style::default().fg(Color::Red).bold(),
-            ));
-        }
+    if let Some(code) = exit_code_from_status(&c.status).filter(|code| *code != 0) {
+        spans.push(Span::styled(
+            format!(" ({code})"),
+            Style::default().fg(Color::Red).bold(),
+        ));
     }
     if app.oom_ids.contains(&c.id) {
         spans.push(Span::styled(" OOM", Style::default().fg(Color::Red).bold()));

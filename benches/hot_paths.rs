@@ -44,7 +44,7 @@ fn main() {
                 tag: format!("registry/service-{i}:latest"),
                 size: i * 1024,
                 created: i,
-                containers: i as usize % 4,
+                containers: i % 4,
             })
             .collect(),
     ));

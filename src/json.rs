@@ -321,10 +321,8 @@ impl<'a> Parser<'a> {
             }
         }
         let s = std::str::from_utf8(&self.b[start..self.i]).unwrap();
-        if !float {
-            if let Ok(i) = s.parse::<i64>() {
-                return Ok(Value::Int(i));
-            }
+        if let Some(i) = s.parse::<i64>().ok().filter(|_| !float) {
+            return Ok(Value::Int(i));
         }
         s.parse::<f64>()
             .ok()

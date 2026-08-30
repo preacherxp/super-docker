@@ -49,20 +49,21 @@ pub struct Docker {
 /// Resolve the daemon socket: `DOCKER_HOST` when set, else the first
 /// existing well-known socket path.
 pub fn connect() -> Result<Docker, Error> {
-    if let Ok(host) = std::env::var("DOCKER_HOST") {
-        if !host.is_empty() {
-            if let Some(p) = host.strip_prefix("unix://") {
-                return Ok(Docker {
-                    transport: Transport::Unix(PathBuf::from(p)),
-                });
-            }
-            if let Some(a) = host.strip_prefix("tcp://") {
-                return Ok(Docker {
-                    transport: Transport::Tcp(a.trim_end_matches('/').to_string()),
-                });
-            }
-            return Err(Error(format!("unsupported DOCKER_HOST: {host}")));
+    if let Some(host) = std::env::var("DOCKER_HOST")
+        .ok()
+        .filter(|host| !host.is_empty())
+    {
+        if let Some(p) = host.strip_prefix("unix://") {
+            return Ok(Docker {
+                transport: Transport::Unix(PathBuf::from(p)),
+            });
         }
+        if let Some(a) = host.strip_prefix("tcp://") {
+            return Ok(Docker {
+                transport: Transport::Tcp(a.trim_end_matches('/').to_string()),
+            });
+        }
+        return Err(Error(format!("unsupported DOCKER_HOST: {host}")));
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let mut candidates = vec![PathBuf::from("/var/run/docker.sock")];
@@ -231,6 +232,10 @@ fn request_refresh(tx: &SyncSender<RefreshKind>, kind: RefreshKind) -> bool {
     }
 }
 
+fn tick_due(ticks: u64, cadence: u64) -> bool {
+    ticks.checked_rem(cadence) == Some(0)
+}
+
 // ---------------------------------------------------------------- worker
 
 pub fn spawn_worker(docker: Docker, tx: AppSender) {
@@ -309,12 +314,12 @@ pub fn spawn_worker(docker: Docker, tx: AppSender) {
                 } else {
                     DISCONNECTED_CONTAINER_POLL_TICKS
                 };
-                if ticks % container_ticks == 0
+                if tick_due(ticks, container_ticks)
                     && !request_refresh(&refresh_tx, RefreshKind::Containers)
                 {
                     return;
                 }
-                if ticks % RESOURCE_POLL_TICKS == 0 {
+                if tick_due(ticks, RESOURCE_POLL_TICKS) {
                     for kind in [
                         RefreshKind::Images,
                         RefreshKind::Volumes,
@@ -325,7 +330,7 @@ pub fn spawn_worker(docker: Docker, tx: AppSender) {
                         }
                     }
                 }
-                if ticks % VOLUME_SIZE_POLL_TICKS == 0
+                if tick_due(ticks, VOLUME_SIZE_POLL_TICKS)
                     && !request_refresh(&refresh_tx, RefreshKind::VolumeSizes)
                 {
                     return;
@@ -1013,20 +1018,24 @@ pub fn spawn_inspect(docker: &Docker, tx: &AppSender, id: String) -> TaskHandle 
         if let Some(st) = d.get("State") {
             push("Status", st.str_of("Status").unwrap_or_default());
             push("Started", st.str_of("StartedAt").unwrap_or_default());
-            if let Some(code) = st.get("ExitCode").and_then(Value::as_i64) {
-                if code != 0 {
-                    push("Exit code", code.to_string());
-                }
+            if let Some(code) = st
+                .get("ExitCode")
+                .and_then(Value::as_i64)
+                .filter(|code| *code != 0)
+            {
+                push("Exit code", code.to_string());
             }
             if st.get("OOMKilled").and_then(Value::as_bool) == Some(true) {
                 push("OOM killed", "yes".into());
             }
             if let Some(h) = st.get("Health") {
                 push("Health", h.str_of("Status").unwrap_or_default());
-                if let Some(streak) = h.get("FailingStreak").and_then(Value::as_i64) {
-                    if streak > 0 {
-                        push("Health fails", streak.to_string());
-                    }
+                if let Some(streak) = h
+                    .get("FailingStreak")
+                    .and_then(Value::as_i64)
+                    .filter(|streak| *streak > 0)
+                {
+                    push("Health fails", streak.to_string());
                 }
                 // last few probe results, newest first — first line only
                 let log = h.get("Log").and_then(Value::as_array).unwrap_or(&[]);
