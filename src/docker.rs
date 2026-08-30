@@ -355,30 +355,18 @@ pub fn spawn_worker(docker: Docker, tx: AppSender) {
                     if tx.send(AppEvent::Event(row)).is_err() {
                         return;
                     }
-                    match msg.get("Type").and_then(Value::as_str) {
-                        Some("container") => {
-                            if !request_refresh(&refresh_tx, RefreshKind::Containers) {
-                                return;
-                            }
-                        }
+                    let connected = match msg.get("Type").and_then(Value::as_str) {
+                        Some("container") => request_refresh(&refresh_tx, RefreshKind::Containers),
                         Some("image") => {
-                            if !request_refresh(&refresh_tx, RefreshKind::Images)
-                                || !request_refresh(&refresh_tx, RefreshKind::Containers)
-                            {
-                                return;
-                            }
+                            request_refresh(&refresh_tx, RefreshKind::Images)
+                                && request_refresh(&refresh_tx, RefreshKind::Containers)
                         }
-                        Some("volume") => {
-                            if !request_refresh(&refresh_tx, RefreshKind::Volumes) {
-                                return;
-                            }
-                        }
-                        Some("network") => {
-                            if !request_refresh(&refresh_tx, RefreshKind::Networks) {
-                                return;
-                            }
-                        }
-                        _ => {}
+                        Some("volume") => request_refresh(&refresh_tx, RefreshKind::Volumes),
+                        Some("network") => request_refresh(&refresh_tx, RefreshKind::Networks),
+                        _ => true,
+                    };
+                    if !connected {
+                        return;
                     }
                 }
             }
