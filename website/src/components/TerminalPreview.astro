@@ -1,0 +1,25 @@
+---
+import capture from "../../../docs/demo.png";
+---
+
+<figure class="terminal">
+  <a
+    class="terminal-capture"
+    href={capture.src}
+    target="_blank"
+    rel="noopener"
+    aria-label="View the actual super-docker terminal capture at full size (opens in a new tab)"
+  >
+    <img
+      src={capture.src}
+      width={capture.width}
+      height={capture.height}
+      fetchpriority="high"
+      decoding="async"
+      alt="super-docker running with the copper theme: the expanded Containers panel and collapsed Compose, Images, Volumes, and Networks panels on the left; container logs on the right; keyboard shortcuts along the bottom."
+    />
+  </a>
+  <figcaption class="sr-only">
+    Captured from the real application with a disposable nginx container.
+  </figcaption>
+</figure>

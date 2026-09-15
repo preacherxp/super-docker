@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://purecode.sh/sitemap-index.xml

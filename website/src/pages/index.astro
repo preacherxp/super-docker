@@ -1,0 +1,453 @@
+---
+import "../styles/global.css";
+import "@fontsource-variable/jetbrains-mono";
+import TerminalPreview from "../components/TerminalPreview.astro";
+import DemoPlayer from "../components/DemoPlayer.vue";
+import InstallCommand from "../components/InstallCommand.vue";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#080a0b" />
+    <meta
+      name="description"
+      content="Meet super-docker. A fast, keyboard-first Docker terminal UI for containers, Compose, images, volumes, and networks. Built in Rust. Made for your flow."
+    />
+    <meta
+      property="og:title"
+      content="super-docker — Docker. In your element."
+    />
+    <meta
+      property="og:description"
+      content="Your entire Docker world. One beautiful terminal. Discover the keyboard-first Docker TUI by Purecode."
+    />
+    <meta property="og:type" content="website" />
+    <title>super-docker — Docker. In your element.</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23080a0b'/%3E%3Ctext x='9' y='43' fill='%23f5ac85' font-family='monospace' font-size='36'%3E%3E_%3C/text%3E%3C/svg%3E"
+    />
+    <link rel="canonical" href="https://purecode.sh/" />
+  </head>
+  <body class="min-h-dvh antialiased">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="#" aria-label="super-docker home"
+        ><span class="brand-symbol">{"{"}<b>sd</b>{"}"}</span><span
+          >super-docker<span class="byline">by Purecode</span></span
+        ></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="#features">Features</a><a href="#workflow">The workflow</a><a
+          href="https://github.com/preacherxp/super-docker"
+          class="github-link">GitHub <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+      <a class="button small" href="#install"
+        >Get super-docker <span aria-hidden="true">↗</span></a
+      >
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-halo" aria-hidden="true"></div>
+        <div class="hero-copy">
+          <a
+            class="release-pill"
+            href="https://github.com/preacherxp/super-docker/releases"
+            ><span class="status-dot"></span> MEET YOUR NEW DOCKER WORKFLOW <span
+              aria-hidden="true">↗</span
+            ></a
+          >
+          <h1 id="hero-title">
+            Docker.<br />In your <span class="gradient-text">element.</span>
+          </h1>
+          <p class="hero-description">
+            Your entire Docker world. One beautiful terminal.<br />A fast,
+            keyboard-first workspace that keeps you in flow.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#install"
+              >Make yourself at home <span aria-hidden="true">↗</span></a
+            ><DemoPlayer client:load />
+          </div>
+          <p class="hero-footnote">
+            Built in Rust <span>·</span> Source on GitHub <span>·</span> macOS &amp;
+            Linux
+          </p>
+        </div>
+
+        <div class="terminal-stage" id="terminal-preview">
+          <TerminalPreview />
+        </div>
+        <p class="preview-caption">
+          <span class="caption-line"></span> Captured in super-docker. Click to view
+          full size. <span class="caption-line"></span>
+        </p>
+        <div class="hero-specs">
+          <span>RUST AT THE CORE</span><span>DOCKER ENGINE, DIRECTLY</span><span
+            >KEYBOARD FIRST</span
+          ><span>YOUR TERMINAL, SUPERCHARGED</span>
+        </div>
+      </section>
+
+      <section class="intro section-shell" id="features">
+        <div class="reveal">
+          <p class="eyebrow">LESS FRICTION. MORE FLOW.</p><h2>
+            You know Docker.<br />Now, <span class="muted"
+              >feel at home in it.</span
+            >
+          </h2><p class="section-description">
+            Containers, logs, resources, and the little things in between.<br
+              class="desktop-break"
+            /> Everything you reach for, brought into one focused workspace.
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card large reveal">
+            <div class="card-top">
+              <span class="eyebrow">01 / THE WHOLE PICTURE</span><span
+                class="card-glyph"
+                aria-hidden="true">▦</span
+              >
+            </div><h3>Five panels.<br />One place to be.</h3><p>
+              Containers, Compose projects, images, volumes, and networks. Move
+              between them without losing your train of thought.
+            </p><div class="panel-stack" aria-hidden="true">
+              <div><span>01</span> Containers <b>5 running</b></div><div>
+                <span>02</span> Compose <b>your-project</b>
+              </div><div><span>03</span> Images <b>node:22-alpine</b></div><div>
+                <span>04</span> Volumes <b>postgres_data</b>
+              </div><div><span>05</span> Networks <b>bridge</b></div>
+            </div><div class="card-bottom">
+              The right context. Always within reach. <span>↗</span>
+            </div>
+          </article>
+          <article class="feature-card large compose-card reveal">
+            <div class="card-top">
+              <span class="eyebrow">02 / BEAUTIFULLY ORCHESTRATED</span><span
+                class="card-glyph"
+                aria-hidden="true">≋</span
+              >
+            </div><h3>A whole stack.<br />A single keystroke.</h3><p>
+              Bring Compose projects up, build services, or take a stack down.
+              See project and service logs together, right where you work.
+            </p><div
+              class="compose-tree"
+              aria-label="Example Compose project with three services"
+            >
+              <div class="tree-root">
+                <span>▱</span> your-next-big-thing <span class="tree-status"
+                  >3 services</span
+                >
+              </div><div class="tree-branch">
+                <span>├─</span><i class="state running"></i> frontend <span
+                  >:3000</span
+                >
+              </div><div class="tree-branch">
+                <span>├─</span><i class="state running"></i> api <span
+                  >:8080</span
+                >
+              </div><div class="tree-branch">
+                <span>└─</span><i class="state running"></i> postgres <span
+                  >:5432</span
+                >
+              </div><div class="compose-key">
+                <kbd>u</kbd><span>and you’re up.</span>
+              </div>
+            </div><div class="card-bottom">
+              Label-based discovery. Compose-aware actions. <span>↗</span>
+            </div>
+          </article>
+          <article class="feature-card reveal">
+            <span class="card-glyph accent" aria-hidden="true">⌁</span><h3>
+              Live, down to the log.
+            </h3><p>
+              Stream logs as they happen. Follow, scroll back, toggle wrapping,
+              and jump to the latest line. Your app’s pulse, uninterrupted.
+            </p><div class="mini-code">
+              <span>10:42:08</span>
+              <b>INFO</b> you’re up to date<span class="mini-cursor">▍</span>
+            </div>
+          </article>
+          <article class="feature-card reveal">
+            <span class="card-glyph accent" aria-hidden="true">↗</span><h3>
+              Know what it’s using.
+            </h3><p>
+              Live CPU and memory stats with history. Network I/O at a glance.
+              Sort containers by resource usage to find the heavy hitters.
+            </p><div class="mini-bars" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i
+              ></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i
+              ></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+          </article>
+          <article class="feature-card reveal">
+            <span class="card-glyph accent" aria-hidden="true">⌕</span><h3>
+              Find the why. Faster.
+            </h3><p>
+              Exit codes, OOM indicators, restart-loop detection, and
+              health-check details. A scrollable Docker event history connects
+              the dots.
+            </p><div class="diagnostic-tags">
+              <span>exit 137</span><span>OOM killed</span><span
+                >↻ restart loop</span
+              >
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="workflow-section" id="workflow">
+        <div class="workflow-sticky section-shell">
+          <div class="workflow-copy">
+            <p class="eyebrow">AT YOUR FINGERTIPS</p>
+            <h2 class="sr-only">From thought to action.</h2>
+            <div class="workflow-steps">
+              <div class="workflow-step active" data-step="0">
+                <span>01 / 03 — FIND</span><div>
+                  <h3>
+                    Find your<br /><span class="gradient-text">focus.</span>
+                  </h3><p>
+                    Fuzzy-filter the noise. Jump between panels.<br />Zoom into
+                    what matters.
+                  </p>
+                </div>
+              </div><div class="workflow-step" data-step="1">
+                <span>02 / 03 — ACT</span><div>
+                  <h3>
+                    Make your<br /><span class="gradient-text">move.</span>
+                  </h3><p>
+                    Start, stop, restart, pause. Open a shell<br />or a
+                    published port with one key.
+                  </p>
+                </div>
+              </div><div class="workflow-step" data-step="2">
+                <span>03 / 03 — KEEP GOING</span><div>
+                  <h3>
+                    Keep your<br /><span class="gradient-text">momentum.</span>
+                  </h3><p>
+                    Copy a name or ID. Mark a batch. See your<br />operation
+                    history. Get back to building.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div><div class="keyboard-scene">
+            <div class="key-orbit" aria-hidden="true"></div><div
+              class="key-assembly"
+            >
+              <div class="key-shadow"></div><div class="hero-key" id="hero-key">
+                /
+              </div><div class="support-key key-j" aria-hidden="true">
+                j
+              </div><div class="support-key key-k" aria-hidden="true">
+                k
+              </div><div class="support-key key-enter" aria-hidden="true">
+                ↵
+              </div>
+            </div><div class="key-label">
+              <span class="key-label-line"></span><span id="key-caption"
+                >A little less searching. A lot more finding.</span
+              >
+            </div><p class="keyboard-note">
+              Vim-style navigation. Mouse support, too.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="details-section section-shell">
+        <div class="section-heading reveal">
+          <div>
+            <p class="eyebrow">THOUGHTFUL, ALL THE WAY DOWN</p><h2>
+              Small details.<br /><span class="muted">Super difference.</span>
+            </h2>
+          </div><p class="section-description">
+            The everyday essentials, considered.<br />Because a great tool gets
+            out of your way.
+          </p>
+        </div>
+        <div class="detail-grid">
+          <article class="reveal">
+            <span class="detail-icon">⌘</span><h3>
+              Complete lifecycle control
+            </h3><p>
+              Start, stop, restart, pause, and unpause. Choose TERM, KILL, or
+              HUP from the signal picker. Exec straight into a container shell.
+            </p>
+          </article>
+          <article class="reveal">
+            <span class="detail-icon">✓</span><h3>
+              Power with peace of mind
+            </h3><p>
+              Mark one or many resources. Batch-remove or prune with
+              confirmation. Remove-all requires an explicit <kbd>y</kbd>, so
+              intent stays intentional.
+            </p>
+          </article>
+          <article class="reveal">
+            <span class="detail-icon">◷</span><h3>
+              A memory for your actions
+            </h3><p>
+              Persistent, local operation history records mutations and their
+              results. Open it with <kbd>O</kbd>, or use <code
+                >sd --history</code
+              > outside the TUI.
+            </p>
+          </article>
+          <article class="reveal">
+            <span class="detail-icon">◈</span><h3>
+              Context beyond containers
+            </h3><p>
+              Inspect images, volumes, and networks with related containers
+              alongside. See volume disk usage and sort each panel your way.
+            </p>
+          </article>
+          <article class="reveal">
+            <span class="detail-icon">↗</span><h3>
+              Shortcuts that go further
+            </h3><p>
+              Copy names and IDs with <kbd>y</kbd> / <kbd>Y</kbd>, including
+              over SSH with OSC 52 support. Open a published port in your
+              browser with <kbd>o</kbd>.
+            </p>
+          </article>
+          <article class="reveal">
+            <span class="detail-icon">⊙</span><h3>
+              Your environment, respected
+            </h3><p>
+              Environment values are masked by default. Connect through a Unix
+              or TCP socket with <code>DOCKER_HOST</code>. Update checks are
+              easy to disable.
+            </p>
+          </article>
+        </div>
+        <details class="keymap reveal">
+          <summary
+            ><span>The whole workflow, by key.</span><span class="keymap-hint"
+              >Explore the shortcuts <b>+</b></span
+            ></summary
+          ><div class="keymap-grid">
+            <div>
+              <h3>Get around</h3><p>
+                <kbd>j</kbd> / <kbd>k</kbd> Move or scroll
+              </p><p><kbd>Tab</kbd> / <kbd>1–5</kbd> Switch panels</p><p>
+                <kbd>Enter</kbd> / <kbd>l</kbd> Focus detail
+              </p><p><kbd>h</kbd> / <kbd>Esc</kbd> Back to panels</p><p>
+                <kbd>z</kbd> Zoom focused pane
+              </p><p><kbd>[</kbd> / <kbd>]</kbd> Logs, stats, info</p><p>
+                <kbd>/</kbd> Fuzzy filter
+              </p><p><kbd>,</kbd> / <kbd>.</kbd> Sort / reverse</p><p>
+                <kbd>g</kbd> / <kbd>G</kbd> First / last
+              </p>
+            </div><div>
+              <h3>Take action</h3><p>
+                <kbd>s</kbd> / <kbd>S</kbd> Stop / start
+              </p><p><kbd>r</kbd> Restart</p><p>
+                <kbd>p</kbd> Pause / unpause
+              </p><p><kbd>K</kbd> Choose kill signal</p><p>
+                <kbd>e</kbd> Open a shell
+              </p><p><kbd>Space</kbd> / <kbd>A</kbd> Mark / mark all</p><p>
+                <kbd>d</kbd> Remove selection
+              </p><p><kbd>D</kbd> Remove all listed</p><p>
+                <kbd>C</kbd> / <kbd>P</kbd> Prune containers / images or volumes
+              </p><p><kbd>u</kbd> / <kbd>b</kbd> Compose up / build</p><p>
+                <kbd>d</kbd> Compose down
+              </p>
+            </div><div>
+              <h3>Stay in flow</h3><p>
+                <kbd>y</kbd> / <kbd>Y</kbd> Copy name / ID
+              </p><p><kbd>o</kbd> Open published port</p><p>
+                <kbd>E</kbd> Docker events
+              </p><p><kbd>O</kbd> Operation history</p><p>
+                <kbd>x</kbd> Show / hide env values
+              </p><p><kbd>f</kbd> Follow logs</p><p><kbd>w</kbd> Wrap logs</p><p
+              >
+                <kbd>PgUp</kbd> / <kbd>PgDn</kbd> Scroll logs
+              </p><p><kbd>?</kbd> In-app help</p><p>
+                <kbd>q</kbd> / <kbd>Ctrl-c</kbd> Quit
+              </p>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="engineering section-shell">
+        <div class="engineering-inner reveal">
+          <p class="eyebrow">SMALL BY DESIGN. SUPER BY NATURE.</p><h2>
+            Close to the metal.<br /><span class="gradient-text"
+              >Closer to your flow.</span
+            >
+          </h2><p>
+            Written in Rust. Connected directly to the Docker Engine API.<br
+            />Event-driven updates keep your workspace current.<br />Dedicated
+            input handling keeps you in control.
+          </p><div class="engineering-facts">
+            <div>
+              <strong>Rust</strong><span>Built for the terminal</span>
+            </div><div>
+              <strong>Direct</strong><span>Docker Engine connection</span>
+            </div><div>
+              <strong>Local</strong><span
+                >Operation history on your machine</span
+              >
+            </div>
+          </div><a
+            class="inline-link"
+            href="https://github.com/preacherxp/super-docker"
+            >Look under the hood <span aria-hidden="true">↗</span></a
+          >
+        </div>
+      </section>
+
+      <section class="install-section section-shell" id="install">
+        <div class="install-glow" aria-hidden="true"></div><div class="reveal">
+          <p class="eyebrow">YOUR TERMINAL. UPGRADED.</p><h2>
+            Good things start<br />with <span class="install-sd"
+              >sd<span class="static-cursor">_</span></span
+            >
+          </h2><p class="section-description">
+            One install. Two letters. Your new everyday.
+          </p><InstallCommand client:visible /><p class="install-run">
+            Then run <code>sd</code>. Welcome home.
+          </p><p class="install-requirements">
+            Requires Rust 1.85+ and a running Docker daemon.<br />Compose up,
+            down, and build require the Docker Compose plugin.
+          </p><div class="install-links">
+            <a
+              class="inline-link"
+              href="https://github.com/preacherxp/super-docker#install"
+              >Installation guide <span aria-hidden="true">↗</span></a
+            ><a
+              class="inline-link"
+              href="https://github.com/preacherxp/super-docker/blob/main/ROADMAP.md"
+              >See what’s next <span aria-hidden="true">↗</span></a
+            >
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer section-shell">
+      <div>
+        <a class="purecode" href="#"
+          ><span>{"{"}</span>Purecode<span>{"}"}</span></a
+        ><p>Tools for people who love building.</p>
+      </div><div class="footer-links">
+        <a href="https://github.com/preacherxp/super-docker">GitHub ↗</a><a
+          href="https://github.com/preacherxp/super-docker/issues"
+          >Feedback ↗</a
+        ><a href="https://github.com/preacherxp/super-docker#readme">Docs ↗</a>
+      </div><span class="footer-note"
+        >Made with intention.<br />© 2026 Purecode</span
+      >
+    </footer>
+    <script>
+      import "../scripts/motion";
+    </script>
+  </body>
+</html>

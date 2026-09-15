@@ -50,3 +50,14 @@ storage can be overridden with `SUPER_DOCKER_DB=/path/to/history.sqlite3`.
 sockets. It uses plain Rust threads, bounded channels, cancellable streams, and
 event-driven targeted refreshes; the Docker CLI is reserved for Compose
 mutations and interactive `docker exec`.
+
+## Website
+
+The landing page lives in [`website/`](website/README.md), using Astro, Vue,
+and Tailwind CSS. With Node.js 22.19+ installed:
+
+```sh
+cd website
+npm ci
+npm run dev
+```

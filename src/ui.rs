@@ -12,11 +12,19 @@ use crate::app::{
     RowState, VisualLogRow, ago, exit_code_from_status, health_from_status, human_bytes, unix_now,
 };
 
-const ACCENT: Color = Color::Cyan;
-// muted-but-readable gray for secondary text (headers, sizes, hints)
-const DIM: Color = Color::Rgb(148, 155, 164);
-// quieter gray reserved for unfocused borders so panels don't shout
-const BORDER_DIM: Color = Color::Rgb(85, 92, 100);
+// Explicit RGB values keep semantic colors readable instead of inheriting a
+// terminal's potentially low-contrast ANSI palette.
+const INK: Color = Color::Rgb(8, 12, 16);
+const ACCENT: Color = Color::Rgb(245, 172, 133);
+const SUCCESS: Color = Color::Rgb(74, 222, 128);
+const WARNING: Color = Color::Rgb(250, 204, 21);
+const DANGER: Color = Color::Rgb(248, 113, 113);
+const INFO: Color = Color::Rgb(96, 165, 250);
+const CPU: Color = Color::Rgb(232, 121, 249);
+const DIM: Color = Color::Rgb(174, 181, 190);
+const BORDER_DIM: Color = Color::Rgb(105, 117, 130);
+const SELECTED_BG: Color = Color::Rgb(48, 39, 36);
+const GAUGE_TRACK: Color = Color::Rgb(35, 42, 50);
 
 /// Height of a collapsed (unfocused) side panel: borders + header + one row.
 const COLLAPSED_PANEL_H: u16 = 4;
@@ -102,8 +110,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
         Span::raw(" "),
         Span::styled(
-            concat!(" ⚡ super-docker v", env!("CARGO_PKG_VERSION"), " "),
-            Style::default().fg(Color::Black).bg(ACCENT).bold(),
+            concat!(" {sd} super-docker v", env!("CARGO_PKG_VERSION"), " "),
+            Style::default().fg(ACCENT).bg(INK).bold(),
         ),
         Span::raw("  "),
         Span::styled(
@@ -117,14 +125,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(
             format!("{running}/{} running", app.containers.len()),
-            Style::default().fg(Color::Green),
+            Style::default().fg(SUCCESS),
         ),
     ];
     if let Some(err) = &app.docker_err {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("⚠ {err}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(DANGER),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -134,10 +142,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .filter(|toast| toast.at.elapsed().as_secs() < 4)
     {
-        let color = if t.error { Color::Red } else { Color::Green };
+        let color = if t.error { DANGER } else { SUCCESS };
         let p = Paragraph::new(Line::from(Span::styled(
             format!(" {} ", t.text),
-            Style::default().fg(Color::Black).bg(color),
+            Style::default().fg(INK).bg(color).bold(),
         )))
         .alignment(Alignment::Right);
         f.render_widget(p, area);
@@ -186,7 +194,7 @@ fn panel_title(
 
 fn mark_span(marked: bool) -> Span<'static> {
     if marked {
-        Span::styled("✓ ", Style::default().fg(Color::Yellow).bold())
+        Span::styled("✓ ", Style::default().fg(WARNING).bold())
     } else {
         Span::raw("")
     }
@@ -217,13 +225,13 @@ fn render_scrollbar(
 
 fn state_dot(state: RowState) -> Span<'static> {
     let (sym, color) = match state {
-        RowState::Running => ("●", Color::Green),
-        RowState::Paused => ("◐", Color::Yellow),
-        RowState::Restarting => ("↻", Color::Yellow),
-        RowState::Exited => ("○", Color::Red),
-        RowState::Created => ("◌", Color::Blue),
-        RowState::Dead => ("✕", Color::Red),
-        RowState::Other => ("?", Color::Gray),
+        RowState::Running => ("●", SUCCESS),
+        RowState::Paused => ("◐", WARNING),
+        RowState::Restarting => ("↻", WARNING),
+        RowState::Exited => ("○", DANGER),
+        RowState::Created => ("◌", INFO),
+        RowState::Dead => ("✕", DANGER),
+        RowState::Other => ("?", DIM),
     };
     Span::styled(format!("{sym} "), Style::default().fg(color))
 }
@@ -280,7 +288,7 @@ fn render_table(
     let viewport_len = area.height.saturating_sub(3) as usize;
     let highlight = if focused {
         Style::default()
-            .bg(Color::Rgb(30, 50, 60))
+            .bg(SELECTED_BG)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
@@ -316,23 +324,20 @@ fn container_badges(app: &App, c: &ContainerRow, now: i64) -> Vec<Span<'static>>
     if let Some(code) = exit_code_from_status(&c.status).filter(|code| *code != 0) {
         spans.push(Span::styled(
             format!(" ({code})"),
-            Style::default().fg(Color::Red).bold(),
+            Style::default().fg(DANGER).bold(),
         ));
     }
     if app.oom_ids.contains(&c.id) {
-        spans.push(Span::styled(" OOM", Style::default().fg(Color::Red).bold()));
+        spans.push(Span::styled(" OOM", Style::default().fg(DANGER).bold()));
     }
     if app.restart_looping(&c.id, now) {
-        spans.push(Span::styled(
-            " ↻loop",
-            Style::default().fg(Color::Yellow).bold(),
-        ));
+        spans.push(Span::styled(" ↻loop", Style::default().fg(WARNING).bold()));
     }
     match health_from_status(&c.status) {
         HealthState::Unhealthy => {
-            spans.push(Span::styled(" ✚", Style::default().fg(Color::Red).bold()))
+            spans.push(Span::styled(" ✚", Style::default().fg(DANGER).bold()))
         }
-        HealthState::Starting => spans.push(Span::styled(" ✚", Style::default().fg(Color::Yellow))),
+        HealthState::Starting => spans.push(Span::styled(" ✚", Style::default().fg(WARNING))),
         _ => {}
     }
     spans
@@ -375,8 +380,8 @@ fn draw_containers_panel(f: &mut Frame, app: &mut App, area: Rect) {
             name_spans.extend(container_badges(app, c, now));
             Row::new(vec![
                 Cell::from(Line::from(name_spans)),
-                Cell::from(cpu).style(Style::default().fg(Color::Magenta)),
-                Cell::from(mem).style(Style::default().fg(Color::Blue)),
+                Cell::from(cpu).style(Style::default().fg(CPU)),
+                Cell::from(mem).style(Style::default().fg(INFO)),
             ])
         })
         .collect();
@@ -421,11 +426,11 @@ fn draw_compose_panel(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|p| {
             let (sym, color) = if p.total == 0 || p.running == 0 {
-                ("○", Color::Red)
+                ("○", DANGER)
             } else if p.running < p.total {
-                ("◐", Color::Yellow)
+                ("◐", WARNING)
             } else {
-                ("●", Color::Green)
+                ("●", SUCCESS)
             };
             Row::new(vec![
                 Cell::from(Line::from(vec![
@@ -879,8 +884,8 @@ fn mask_env(v: &str) -> String {
 
 fn log_level_style(level: LogLevel) -> Style {
     match level {
-        LogLevel::Error => Style::default().fg(Color::Red),
-        LogLevel::Warn => Style::default().fg(Color::Yellow),
+        LogLevel::Error => Style::default().fg(DANGER),
+        LogLevel::Warn => Style::default().fg(WARNING),
         LogLevel::Debug => Style::default().fg(DIM),
         LogLevel::Normal => Style::default(),
     }
@@ -998,7 +1003,7 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                 " following · wrap:{} ",
                 if app.wrap_logs { "on" } else { "off" }
             ),
-            Style::default().fg(Color::Black).bg(Color::Green),
+            Style::default().fg(INK).bg(SUCCESS).bold(),
         )
     } else {
         Span::styled(
@@ -1006,7 +1011,7 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                 " {end}/{len} rows · f follow · w wrap:{} ",
                 if app.wrap_logs { "on" } else { "off" }
             ),
-            Style::default().fg(Color::Black).bg(Color::Yellow),
+            Style::default().fg(INK).bg(WARNING).bold(),
         )
     };
     f.render_widget(block.title(mode), area);
@@ -1078,7 +1083,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         (last.cpu_pct / cpu_capacity as f64).clamp(0.0, 1.0),
         &hist.cpu,
         cpu_capacity,
-        Color::Magenta,
+        CPU,
     );
     let mem_label = if last.mem_limit == 0 {
         format!("{:.1}% · {}", last.mem_pct, human_bytes(last.mem_used))
@@ -1098,7 +1103,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         (last.mem_pct / 100.0).clamp(0.0, 1.0),
         &hist.mem,
         100,
-        Color::Blue,
+        INFO,
     );
     draw_rate_stat_card(
         f,
@@ -1107,7 +1112,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         last.rx_rate,
         last.rx,
         &hist.rx_rate,
-        Color::Green,
+        SUCCESS,
     );
     draw_rate_stat_card(
         f,
@@ -1116,7 +1121,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         last.tx_rate,
         last.tx,
         &hist.tx_rate,
-        Color::Yellow,
+        WARNING,
     );
 
     let ports = if c.ports.is_empty() { "-" } else { &c.ports };
@@ -1168,7 +1173,7 @@ fn draw_gauge_stat_card(
         Gauge::default()
             .ratio(ratio)
             .label(label)
-            .gauge_style(Style::default().fg(color).bg(Color::Rgb(30, 30, 30))),
+            .gauge_style(Style::default().fg(color).bg(GAUGE_TRACK)),
         chunks[0],
     );
     if chunks[1].height > 0 {
@@ -1230,18 +1235,18 @@ fn draw_stats_compact(
     };
     let lines = vec![
         Line::from(vec![
-            Span::styled("CPU  ", Style::default().fg(Color::Magenta).bold()),
+            Span::styled("CPU  ", Style::default().fg(CPU).bold()),
             Span::raw(format!(
                 "{:.1}% · {} {cpu_unit}",
                 sample.cpu_pct, sample.cpu_cores
             )),
         ]),
         Line::from(vec![
-            Span::styled("MEM  ", Style::default().fg(Color::Blue).bold()),
+            Span::styled("MEM  ", Style::default().fg(INFO).bold()),
             Span::raw(format!("{:.1}% · {memory}", sample.mem_pct)),
         ]),
         Line::from(vec![
-            Span::styled("NET  ", Style::default().fg(Color::Green).bold()),
+            Span::styled("NET  ", Style::default().fg(SUCCESS).bold()),
             Span::raw(format!(
                 "↓{}  ↑{}",
                 human_rate(sample.rx_rate),
@@ -1263,7 +1268,7 @@ fn human_rate(bytes_per_second: u64) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
         Mode::Filter => Line::from(vec![
-            Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::styled(" / ", Style::default().fg(INK).bg(WARNING).bold()),
             Span::raw(format!("{}▏", app.filter)),
             Span::styled("  Enter keep · Esc clear", Style::default().fg(DIM)),
         ]),
@@ -1349,7 +1354,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             if !app.filter.is_empty() {
                 spans.push(Span::styled(
                     format!(" filter:{} ", app.filter),
-                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                    Style::default().fg(INK).bg(WARNING).bold(),
                 ));
                 spans.push(Span::raw(" "));
             }
@@ -1399,14 +1404,14 @@ fn draw_confirm(f: &mut Frame, text: &str, explicit_yes: bool) {
     } else {
         "y/Enter confirm · any other key cancel"
     };
-    draw_modal(f, " confirm ", Color::Red, text, hint);
+    draw_modal(f, " confirm ", DANGER, text, hint);
 }
 
 fn draw_signal(f: &mut Frame, name: &str) {
     draw_modal(
         f,
         " kill ",
-        Color::Yellow,
+        WARNING,
         &format!("Send a signal to '{name}'?"),
         "t TERM · k KILL · h HUP · any other key cancel",
     );
@@ -1416,7 +1421,7 @@ fn draw_update(f: &mut Frame, version: &str) {
     draw_modal(
         f,
         " update ",
-        Color::Green,
+        SUCCESS,
         &format!("super-docker v{version} is available"),
         "y/Enter install · any other key later",
     );
@@ -1492,13 +1497,13 @@ fn event_action_color(action: &str) -> Color {
     if action.contains("unhealthy")
         || matches!(action, "die" | "kill" | "oom" | "destroy" | "delete")
     {
-        Color::Red
+        DANGER
     } else if action.contains("healthy")
         || matches!(action, "start" | "create" | "restart" | "unpause")
     {
-        Color::Green
+        SUCCESS
     } else if matches!(action, "stop" | "pause") {
-        Color::Yellow
+        WARNING
     } else {
         DIM
     }
@@ -1560,9 +1565,9 @@ fn draw_events(f: &mut Frame, app: &App) {
 
 fn operation_status_color(status: &str) -> Color {
     match status {
-        "succeeded" => Color::Green,
-        "failed" | "interrupted" => Color::Red,
-        "running" => Color::Yellow,
+        "succeeded" => SUCCESS,
+        "failed" | "interrupted" => DANGER,
+        "running" => WARNING,
         _ => DIM,
     }
 }
@@ -1791,10 +1796,10 @@ mod tests {
 
     #[test]
     fn log_line_style_matches_levels() {
-        assert_eq!(log_line_style("ERROR: boom").fg, Some(Color::Red));
-        assert_eq!(log_line_style("fatal crash").fg, Some(Color::Red));
-        assert_eq!(log_line_style("thread panicked").fg, Some(Color::Red));
-        assert_eq!(log_line_style("WARN slow query").fg, Some(Color::Yellow));
+        assert_eq!(log_line_style("ERROR: boom").fg, Some(DANGER));
+        assert_eq!(log_line_style("fatal crash").fg, Some(DANGER));
+        assert_eq!(log_line_style("thread panicked").fg, Some(DANGER));
+        assert_eq!(log_line_style("WARN slow query").fg, Some(WARNING));
         assert_eq!(log_line_style("DEBUG noise").fg, Some(DIM));
         assert_eq!(log_line_style("plain info line").fg, None);
     }
@@ -1858,12 +1863,12 @@ mod tests {
 
     #[test]
     fn event_action_colors() {
-        assert_eq!(event_action_color("die"), Color::Red);
-        assert_eq!(event_action_color("oom"), Color::Red);
-        assert_eq!(event_action_color("health_status: unhealthy"), Color::Red);
-        assert_eq!(event_action_color("health_status: healthy"), Color::Green);
-        assert_eq!(event_action_color("start"), Color::Green);
-        assert_eq!(event_action_color("stop"), Color::Yellow);
+        assert_eq!(event_action_color("die"), DANGER);
+        assert_eq!(event_action_color("oom"), DANGER);
+        assert_eq!(event_action_color("health_status: unhealthy"), DANGER);
+        assert_eq!(event_action_color("health_status: healthy"), SUCCESS);
+        assert_eq!(event_action_color("start"), SUCCESS);
+        assert_eq!(event_action_color("stop"), WARNING);
         assert_eq!(event_action_color("attach"), DIM);
     }
 
