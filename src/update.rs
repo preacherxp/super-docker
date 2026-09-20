@@ -55,22 +55,28 @@ pub fn spawn_check(tx: AppSender) {
 
 /// Install one exact release selected in the TUI.
 pub fn install_release(tag: &str) -> Result<(), String> {
-    match Command::new("cargo")
+    parse_version(tag).ok_or("invalid release tag")?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let directory = executable
+        .parent()
+        .ok_or("cannot locate install directory")?;
+    let operation = crate::operations::begin("update", "application", "super-docker", tag);
+    let result = match Command::new("sh")
         .args([
-            "install",
-            "--git",
-            REPOSITORY,
-            "--tag",
+            "-c",
+            include_str!("../install.sh"),
+            "super-docker-installer",
             tag,
-            "--force",
-            "super-docker",
         ])
+        .env("SUPER_DOCKER_INSTALL_DIR", directory)
         .status()
     {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("cargo install exited with {status}")),
-        Err(error) => Err(format!("could not run Cargo: {error}")),
-    }
+        Ok(status) => Err(format!("binary installer exited with {status}")),
+        Err(error) => Err(format!("could not run installer: {error}")),
+    };
+    operation.finish(&result);
+    result
 }
 
 fn cache_path() -> PathBuf {
@@ -102,10 +108,21 @@ fn mark_checked(path: &Path) {
 
 fn find_newer_release(current: &str) -> Option<Release> {
     let current = parse_version(current)?;
-    let mut command = Command::new("git");
-    command
-        .args(["ls-remote", "--tags", "--refs", REPOSITORY])
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = Command::new("curl");
+    command.args([
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "-fsSLI",
+        "--max-time",
+        "3",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{url_effective}",
+        &format!("{REPOSITORY}/releases/latest"),
+    ]);
     let output = output_with_timeout(&mut command, CHECK_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
@@ -136,22 +153,26 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<O
     }
 }
 
-fn latest_release(refs: &str, current: Version) -> Option<Release> {
-    refs.lines()
-        .filter_map(|line| line.split_once('\t').map(|(_, name)| name))
-        .filter_map(|name| name.strip_prefix("refs/tags/"))
-        .filter_map(|tag| {
-            parse_version(tag).map(|version| Release {
-                tag: tag.into(),
-                version,
-            })
-        })
-        .filter(|release| release.version > current)
-        .max_by_key(|release| release.version)
+fn latest_release(url: &str, current: Version) -> Option<Release> {
+    let tag = url
+        .trim()
+        .strip_prefix(&format!("{REPOSITORY}/releases/tag/"))?;
+    let version = parse_version(tag)?;
+    (version > current).then(|| Release {
+        tag: tag.into(),
+        version,
+    })
 }
 
 fn parse_version(value: &str) -> Option<Version> {
-    let mut parts = value.strip_prefix('v').unwrap_or(value).split('.');
+    let value = value.strip_prefix('v').unwrap_or(value);
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let mut parts = value.split('.');
     let version = Version {
         major: parts.next()?.parse().ok()?,
         minor: parts.next()?.parse().ok()?,
@@ -190,31 +211,40 @@ mod tests {
     }
 
     #[test]
-    fn chooses_highest_tag_newer_than_current() {
-        let refs = concat!(
-            "a\trefs/tags/v0.1.1\n",
-            "b\trefs/tags/v0.2.0\n",
-            "c\trefs/tags/v0.1.9\n",
-            "d\trefs/tags/nightly\n",
-        );
-        let release = latest_release(refs, parse_version("0.1.1").unwrap()).unwrap();
+    fn recognizes_a_newer_published_release() {
+        let url = format!("{REPOSITORY}/releases/tag/v0.2.0");
+        let release = latest_release(&url, parse_version("0.1.1").unwrap()).unwrap();
         assert_eq!(release.tag, "v0.2.0");
         assert_eq!(release.version.to_string(), "0.2.0");
     }
 
     #[test]
     fn does_not_offer_same_or_older_versions() {
-        let refs = "a\trefs/tags/v0.1.0\nb\trefs/tags/v0.1.1\n";
-        assert_eq!(latest_release(refs, parse_version("0.1.1").unwrap()), None);
+        for tag in ["v0.1.0", "v0.1.1"] {
+            let url = format!("{REPOSITORY}/releases/tag/{tag}");
+            assert_eq!(latest_release(&url, parse_version("0.1.1").unwrap()), None);
+        }
     }
 
     #[test]
-    fn malformed_versions_and_refs_are_ignored() {
-        for invalid in ["", "v", "1", "1.2", "1.2.3.4", "1.x.3", "v1.2.-3"] {
+    fn malformed_versions_and_release_urls_are_ignored() {
+        for invalid in [
+            "",
+            "v",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.x.3",
+            "v1.2.-3",
+            "v+1.2.3",
+            "v1.2.3;id",
+        ] {
             assert_eq!(parse_version(invalid), None, "accepted {invalid:?}");
         }
-        let refs = "missing-tab\na\trefs/heads/v9.0.0\nb\trefs/tags/nope\n";
-        assert_eq!(latest_release(refs, parse_version("1.0.0").unwrap()), None);
+        for url in ["", "https://example.com/releases/tag/v9.0.0", REPOSITORY] {
+            assert_eq!(latest_release(url, parse_version("1.0.0").unwrap()), None);
+        }
+        assert!(install_release("v1.2.3;id").is_err());
     }
 
     #[test]

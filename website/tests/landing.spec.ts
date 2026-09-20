@@ -48,7 +48,7 @@ test("install copy and permission-denied fallback work", async ({ page }) => {
     .waitFor();
   await page.locator("#copy-install").click();
   expect(await page.evaluate(() => (window as any).copiedCommand)).toBe(
-    "cargo install --git https://github.com/preacherxp/super-docker super-docker",
+    "curl -fsSL https://github.com/preacherxp/super-docker/releases/latest/download/install.sh | sh",
   );
   await expect(page.getByRole("status")).toContainText("copied to clipboard");
   await expect(page.locator("#copy-install svg")).toBeVisible();
@@ -70,7 +70,7 @@ test("install copy and permission-denied fallback work", async ({ page }) => {
   await expect(page.getByRole("status")).toContainText("Command selected");
   expect(
     await page.evaluate(() => window.getSelection()?.toString()),
-  ).toContain("cargo install");
+  ).toContain("curl -fsSL");
 });
 
 test("demo loads on request, closes, and returns focus", async ({ page }) => {
@@ -143,47 +143,19 @@ test("layout, feature links, and accessibility remain usable", async ({
   expect(failures).toEqual([]);
 });
 
-test("scroll story advances, with a static reduced-motion fallback", async ({
+test("workflow is compact and readable without scroll-driven steps", async ({
   page,
 }) => {
-  await page.goto("/");
-  const staticLayout = await page.evaluate(
-    () =>
-      matchMedia("(prefers-reduced-motion: reduce)").matches ||
-      innerWidth <= 700,
-  );
-  if (staticLayout) {
-    expect(
-      await page
-        .locator(".workflow-sticky")
-        .evaluate((node) => getComputedStyle(node).position),
-    ).toBe("relative");
-    for (const step of await page.locator(".workflow-step").all()) {
-      expect(
-        await step.evaluate((node) => getComputedStyle(node).opacity),
-      ).toBe("1");
-    }
-  } else {
-    for (const [progress, key, title, description] of [
-      [0, "/", "Find yourfocus.", "Fuzzy-filter"],
-      [0.5, "e", "Make yourmove.", "Open a shell"],
-      [1, "y", "Keep yourmomentum.", "Copy a name"],
-      [0, "/", "Find yourfocus.", "Fuzzy-filter"],
-    ] as const) {
-      await page.evaluate((progress) => {
-        const section = document.querySelector(".workflow-section")!;
-        const top = section.getBoundingClientRect().top + scrollY;
-        scrollTo({
-          top: top - 83 + progress * (section.clientHeight - innerHeight + 83),
-          behavior: "instant",
-        });
-      }, progress);
-      await expect(page.locator("#hero-key")).toHaveText(key);
-      await expect(page.locator(".workflow-step:visible")).toHaveCount(1);
-      await expect(page.locator(".workflow-step:visible h3")).toHaveText(title);
-      await expect(page.locator(".workflow-step:visible p")).toContainText(
-        description,
-      );
-    }
+  await page.goto("/#workflow");
+  const steps = page.locator(".workflow-step");
+  await expect(steps).toHaveCount(3);
+  for (const step of await steps.all()) {
+    await step.scrollIntoViewIfNeeded();
+    await expect(step).toBeVisible();
+    await expect(step).toHaveCSS("opacity", "1");
   }
+  const height = await page
+    .locator("#workflow")
+    .evaluate((node) => node.clientHeight);
+  expect(height).toBeLessThan(900);
 });

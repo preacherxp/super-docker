@@ -2,7 +2,7 @@
 import { ref } from "vue";
 
 const command =
-  "cargo install --git https://github.com/preacherxp/super-docker super-docker";
+  "curl -fsSL https://github.com/preacherxp/super-docker/releases/latest/download/install.sh | sh";
 const code = ref<HTMLElement>();
 const copied = ref(false);
 const message = ref("");
@@ -55,7 +55,7 @@ async function copyCommand() {
 
 <style scoped>
 .copy-message {
-  font-size: 11px;
+  font-size: 14px;
   color: var(--accent);
   margin-top: 8px;
 }

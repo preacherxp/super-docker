@@ -16,7 +16,7 @@ npm run dev
 
 Open the local URL printed by Astro. Edit the page in `src/pages/index.astro`,
 styles in `src/styles/global.css`, and interactions in `src/components/`.
-The scroll story lives in `src/scripts/motion.ts`.
+Section reveals live in `src/scripts/motion.ts`.
 
 ## Build and preview
 
@@ -42,6 +42,6 @@ npm test
 ```
 
 Checks cover desktop, mobile, reduced motion, the real capture asset, copy
-success and failure, demo playback and focus restoration, scroll steps,
+success and failure, demo playback and focus restoration, the compact workflow,
 horizontal overflow, and automated accessibility checks. To use an existing
 Chrome installation, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to its executable.

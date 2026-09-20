@@ -10,17 +10,28 @@ images, volumes, and networks.
 Requirements:
 
 - A running Docker daemon
-- Rust 1.85 or newer
 - The Docker Compose plugin for Compose actions such as `up` and `build`
 
-Install directly from GitHub:
+Install a prebuilt binary on macOS or Linux (Intel/AMD64 or ARM64). No Rust
+toolchain is needed; the installer uses `curl`, `tar`, and a SHA-256 utility:
 
 ```sh
-cargo install --git https://github.com/preacherxp/super-docker super-docker
-sd
+curl -fsSL https://github.com/preacherxp/super-docker/releases/latest/download/install.sh | sh
+~/.local/bin/sd
 ```
 
-Or build from a local checkout:
+The installer verifies the release checksum and puts `sd` and `super-docker`
+in `~/.local/bin`, without sudo. If that directory is not on your PATH, add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell configuration. Set
+`SUPER_DOCKER_INSTALL_DIR` on the `sh` command to choose another directory.
+Rerun the installer to update, or accept the in-app update prompt.
+
+For a manual install, download your platform's archive and matching `.sha256`
+file from [Releases](https://github.com/preacherxp/super-docker/releases),
+verify it with `sha256sum -c` (Linux) or `shasum -a 256 -c` (macOS), and extract
+both executables into a directory on your PATH.
+
+Building from source is still available with a current stable Rust toolchain:
 
 ```sh
 git clone https://github.com/preacherxp/super-docker.git
@@ -28,6 +39,11 @@ cd super-docker
 cargo install --path .
 sd
 ```
+
+Releases before the binary installer was introduced are source-only. To publish
+binaries, bump the Cargo package version and push its matching `vX.Y.Z` tag.
+The release workflow builds all four platforms and publishes the installer,
+archives, and checksums together after every build succeeds.
 
 Both `sd` and `super-docker` launch the same application. Press `?` for the
 complete key map and `q` to quit.

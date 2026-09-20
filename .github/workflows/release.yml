@@ -1,0 +1,86 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build and package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          SUPER_DOCKER_DB: ${{ runner.temp }}/super-docker-release.sqlite
+          SUPER_DOCKER_NO_UPDATE_CHECK: "1"
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "$RELEASE_TAG" = "v$version"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export CC=musl-gcc
+          fi
+          cargo test --locked --lib --target "$TARGET"
+          cargo build --locked --release --bin sd --target "$TARGET"
+          test "$(target/$TARGET/release/sd --version)" = "super-docker $version"
+          mkdir -p package dist
+          cp "target/$TARGET/release/sd" package/sd
+          ln -s sd package/super-docker
+          asset="super-docker-$TARGET.tar.gz"
+          tar -czf "dist/$asset" -C package sd super-docker
+          cd dist
+          shasum -a 256 "$asset" > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > release-state; then
+            test "$(cat release-state)" = true
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* install.sh --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest
